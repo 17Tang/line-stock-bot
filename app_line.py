@@ -1,16 +1,21 @@
 import asyncio
 import datetime
+import hashlib
+import hmac
+import html
+import http.server
+import json
+import os
+import threading
+import httpx
 import pandas as pd
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import yfinance as yf
 
 # ==========================================
 # ⚙️ 核心設定區
 # ==========================================
-# ⚠️ 請將下方引號內的文字，替換成 @BotFather 給你的 HTTP API Token
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-
+LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 
 # ==========================================
 # 📊 數據下載與關鍵價計算邏輯
@@ -64,85 +69,104 @@ def calculate_stock_prices(stock_id):
         "w_key": w_key, "m_key": m_key
     }
 
+# ==========================================
+# 🤖 LINE Webhook 伺服器接收端
+# ==========================================
+class LineWebhookHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"LINE Bot Webhook Server is running perfectly!")
+
+    def do_POST(self):
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length)
+        
+        signature = self.headers.get('X-Line-Signature', '')
+        if not verify_signature(post_data, signature):
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        self.send_response(200)
+        self.end_headers()
+
+        try:
+            body = json.loads(post_data.decode('utf-8'))
+            for event in body.get('events', []):
+                if event.get('type') == 'message' and event['message'].get('type') == 'text':
+                    reply_token = event['replyToken']
+                    user_text = event['message']['text'].strip()
+                    threading.Thread(target=process_and_reply_line, args=(reply_token, user_text)).start()
+        except Exception as e:
+            print(f"解析錯誤: {e}")
+
+def verify_signature(body, signature):
+    if not LINE_SECRET: return False
+    hash = hmac.new(LINE_SECRET.encode('utf-8'), body, hashlib.sha256).digest()
+    import base64
+    expected_signature = base64.b64encode(hash).decode('utf-8')
+    return hmac.compare_digest(expected_signature, signature)
 
 # ==========================================
-# 🤖 機器人互動指令回覆邏輯
+# ✉️ LINE 訊息回覆傳送邏輯（防洗版暗號版）
 # ==========================================
+def process_and_reply_line(reply_token, user_text):
+    if user_text == "開始" or user_text.lower() == "hello":
+        send_line_reply(reply_token, "👋 歡迎使用關鍵價看盤助手！\n\n💡 為了防洗版，現在請在股號前加一個『#』。\n👉 例如輸入：`#2330` 或 `#AAPL` 即可查價。")
+        return
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
-        "👋 歡迎使用關鍵價看盤助手！\n\n"
-        "💡 **使用方法：**\n"
-        "直接在對話框輸入股票代號即可查詢。\n"
-        "👉 例如輸入: `2330`、`8069` 或 `AAPL`"
-    )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    # ⚡ 檢查暗號
+    if not user_text.startswith("#"):
+        return
 
-
-async def handle_stock_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.strip()
-    status_message = await update.message.reply_text("🔍 正在大數據撈取與計算中，請稍候...")
+    stock_id = user_text[1:].strip()
+    if not stock_id:
+        return
 
     try:
-        p = calculate_stock_prices(user_text)
+        p = calculate_stock_prices(stock_id)
         if p is None:
-            await status_message.edit_text(f"❌ 找不到股票代號 '{user_text}' 的資料。")
+            send_line_reply(reply_token, f"❌ 找不到股票代號 '{stock_id}' 的資料，請確認是否輸入正確。")
             return
 
         report_text = (
-            f"📊 **股票標的：{p['ticker_id']}**\n"
-            f"🟧 **股票現價：{p['current']:.2f}**\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📅 **【今日技術指標】**\n"
-            f"🟥 今日壓力：`{p['t_res']:.2f}`\n"
-            f"🟨 今日關鍵：`{p['t_key']:.2f}`\n"
-            f"🟩 今日支撐：`{p['t_sup']:.2f}`\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"⏳ **【前日技術指標】**\n"
-            f"🛑 前日壓力：`{p['p_res']:.2f}`\n"
-            f"🪙 前日關鍵：`{p['p_key']:.2f}`\n"
-            f"❇️ 前日支撐：`{p['p_sup']:.2f}`\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📈 **【長線波段參考】**\n"
-            f"🔷 周關鍵價：`{p['w_key']:.2f}`\n"
-            f"🔶 月關鍵價：`{p['m_key']:.2f}`\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💡 *提示：點擊數字可直接複製。*"
+            f"📊 股票標的：{p['ticker_id']}\n"
+            f"🟧 股票現價：{p['current']:.2f}\n"
+            f"━━━━━━━━━━━━━\n"
+            f"📅 【今日技術指標】\n"
+            f"🟥 今日壓力：{p['t_res']:.2f}\n"
+            f"🟨 今日關鍵：{p['t_key']:.2f}\n"
+            f"🟩 今日支撐：{p['t_sup']:.2f}\n"
+            f"━━━━━━━━━━━━━\n"
+            f"⏳ 【前日技術指標】\n"
+            f"🛑 前日壓力：{p['p_res']:.2f}\n"
+            f"🪙 前日關鍵：{p['p_key']:.2f}\n"
+            f"❇️ 前日支撐：{p['p_sup']:.2f}\n"
+            f"━━━━━━━━━━━━━\n"
+            f"📈 【長線波段參考】\n"
+            f"🔷 周關鍵價：{p['w_key']:.2f}\n"
+            f"🔶 月關鍵價：{p['m_key']:.2f}"
         )
-        await status_message.edit_text(report_text, parse_mode="Markdown")
-
+        send_line_reply(reply_token, report_text)
     except Exception as e:
-        print(f"錯誤報告: {e}")
-        await status_message.edit_text("❌ 系統計算時發生錯誤，請稍後再試。")
+        print(f"LINE 回覆出錯: {e}")
+        send_line_reply(reply_token, "❌ 系統計算發生錯誤，請稍後再試。")
 
-
-# ==========================================
-# 🚀 啟動非同步監聽主程式 (繞過相容性 Bug)
-# ==========================================
-async def run_bot():
-    print("🤖 關鍵價 Telegram 機器人正在啟動中...")
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stock_query))
-
-    # 核心替代方案：手動初始化與啟動更新機制，跳過 run_polling 的清理段落
-    await app.initialize()
-    await app.updater.start_polling()
-    await app.start()
-    
-    print("🟢 機器人已成功上線！請打開 Telegram 開始測試。")
-    
-    # 讓程式保持運行
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except (KeyboardInterrupt, SystemExit):
-        print("🛑 機器人正在關閉...")
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+def send_line_reply(reply_token, text):
+    url = "https://api.line.me/v2/bot/message/reply"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_ACCESS_TOKEN}"
+    }
+    payload = {
+        "replyToken": reply_token,
+        "messages": [{"type": "text", "text": text}]
+    }
+    httpx.post(url, json=payload, headers=headers)
 
 if __name__ == "__main__":
-    # 執行非同步主迴圈
-    asyncio.run(run_bot())
+    server = http.server.HTTPServer(('0.0.0.0', 10000), LineWebhookHandler)
+    print("🟢 LINE 機器人 Webhook 伺服器已在連接埠 10000 啟動...")
+    server.serve_forever()

@@ -36,16 +36,11 @@ def calculate_stock_prices(stock_id):
         ticker_id = stock_id.upper()
         df_daily = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
 
-    if df_daily.empty or len(df_daily) < 3:  # 確保至少有3天數據可回退
+    if df_daily.empty or len(df_daily) < 2:
         return None
 
     if isinstance(df_daily.columns, pd.MultiIndex):
         df_daily.columns = df_daily.columns.get_level_values(0)
-
-    # ⚡ 核心修正：若半夜下載到未開盤的空數據，強制拋棄它，改抓前一天
-    import numpy as np
-    if pd.isna(df_daily.iloc[-1]["Close"]) or df_daily.iloc[-1]["Volume"] == 0 or np.isnan(df_daily.iloc[-1]["Close"]):
-        df_daily = df_daily.iloc[:-1]
 
     t_day = df_daily.iloc[-1]
     p_day = df_daily.iloc[-2]
@@ -73,6 +68,7 @@ def calculate_stock_prices(stock_id):
         "p_res": p_res, "p_key": p_key, "p_sup": p_sup,
         "w_key": w_key, "m_key": m_key
     }
+
 # ==========================================
 # 🤖 LINE Webhook 伺服器接收端
 # ==========================================
@@ -136,20 +132,19 @@ def process_and_reply_line(reply_token, user_text):
             return
 
         report_text = (
-            f"📊 股票標的：{p['ticker_id']}\n"
-            f"🟧 股票現價：{p['current']:.2f}\n"
+            f"🚀 【標的】：{p['ticker_id']}\n"
+            f"🔥 【現價】：{p['current']:.2f}\n"
             f"━━━━━━━━━━━━━\n"
-            f"📅 【今日技術指標】\n"
-            f"🟥 今日壓力：{p['t_res']:.2f}\n"
-            f"🟨 今日關鍵：{p['t_key']:.2f}\n"
-            f"🟩 今日支撐：{p['t_sup']:.2f}\n"
+            f"📊 【今日關鍵價】\n"
+            f"🟥 壓力：{p['t_res']:.2f}\n"
+            f"🔑 關鍵：{p['t_key']:.2f}\n"
+            f"🟩 支撐：{p['t_sup']:.2f}\n"
             f"━━━━━━━━━━━━━\n"
-            f"⏳ 【前日技術指標】\n"
-            f"🛑 前日壓力：{p['p_res']:.2f}\n"
-            f"🪙 前日關鍵：{p['p_key']:.2f}\n"
-            f"❇️ 前日支撐：{p['p_sup']:.2f}\n"
+            f"📊 【前日關鍵價】\n"
+            f"🟥 壓力：{p['p_res']:.2f}\n"
+            f"🔑 關鍵：{p['p_key']:.2f}\n"
+            f"🟩 支撐：{p['p_sup']:.2f}\n"
             f"━━━━━━━━━━━━━\n"
-            f"📈 【長線波段參考】\n"
             f"🔷 周關鍵價：{p['w_key']:.2f}\n"
             f"🔶 月關鍵價：{p['m_key']:.2f}"
         )

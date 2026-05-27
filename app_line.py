@@ -109,14 +109,19 @@ class LineWebhookHandler(http.server.BaseHTTPRequestHandler):
             print(f"解析錯誤: {e}")
 
 def verify_signature(body, signature):
-    """驗證 LINE 簽章機制"""
-    if not LINE_SECRET: return False
+    """驗證 LINE 簽章機制（完美修正版）"""
+    if not LINE_SECRET: 
+        return False
+        
+    # 使用你的 Secret 金鑰對收到的訊息進行 HMAC-SHA256 加密
     hash = hmac.new(LINE_SECRET.encode('utf-8'), body, hashlib.sha256).digest()
-    encoded_signature = b64_encode(hash) # 用標準自訂方式或直接比對Base64
+    
+    # 轉換成 Base64 字串
     import base64
     expected_signature = base64.b64encode(hash).decode('utf-8')
+    
+    # 安全比對兩邊的簽章是否一致
     return hmac.compare_digest(expected_signature, signature)
-
 # ==========================================
 # ✉️ LINE 訊息回覆傳送邏輯
 # ==========================================

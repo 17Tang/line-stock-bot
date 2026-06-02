@@ -208,22 +208,22 @@ def process_and_reply_line(reply_token, user_text):
 
         # ⚡ 升級現價欄位輸出格式
         report_text = (
-            f"🚀 【標的】：{p['ticker_id']}\n"
-            f"🔥 【現價】：{p['current']:.2f} {p['change_str']}\n"
-            f"⏰ 【時間】：{p['quote_time']}\n"
+            f"【標的】：{p['ticker_id']}\n"
+            f"【現價】：{p['current']:.2f} {p['change_str']}\n"
+            f"【時間】：{p['quote_time']}\n"
             f"━━━━━━━━━━━━━\n"
-            f"📊 【今日關鍵價】\n"
-            f"🟥 空方防守價：{p['t_res']:.2f}\n"
-            f"🔑 關鍵價：{p['t_key']:.2f}\n"
-            f"🟩 多方防守價：{p['t_sup']:.2f}\n"
+            f"【今日關鍵價】\n"
+            f" 空方防守價：{p['t_res']:.2f}\n"
+            f" 關鍵價：{p['t_key']:.2f}\n"
+            f" 多方防守價：{p['t_sup']:.2f}\n"
             f"━━━━━━━━━━━━━\n"
-            f"📊 【前日關鍵價】\n"
-            f"🟥 空方防守價：{p['p_res']:.2f}\n"
-            f"🔑 關鍵價：{p['p_key']:.2f}\n"
-            f"🟩 多方防守價：{p['p_sup']:.2f}\n"
+            f"【前日關鍵價】\n"
+            f" 空方防守價：{p['p_res']:.2f}\n"
+            f" 關鍵價：{p['p_key']:.2f}\n"
+            f" 多方防守價：{p['p_sup']:.2f}\n"
             f"━━━━━━━━━━━━━\n"
-            f"🔷 周關鍵價：{p['w_key']:.2f}\n"
-            f"🔶 月關鍵價：{p['m_key']:.2f}"
+            f" 周關鍵價：{p['w_key']:.2f}\n"
+            f" 月關鍵價：{p['m_key']:.2f}"
         )
         send_line_reply(reply_token, report_text)
     except Exception as e:

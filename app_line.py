@@ -10,10 +10,11 @@ import threading
 import httpx
 import pandas as pd
 import yfinance as yf
-import twstock  # ⚡ 引入台灣股市繁體中文資料庫
+import twstock
+import pytz  # ⚡ 引入時區套件，確保轉換為台灣時間
 
 # ==========================================
-# ⚙️ 核心設定區（從 Render 後台安全讀取環境變數）
+# ⚙️ 核心設定區
 # ==========================================
 LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
@@ -37,6 +38,7 @@ def calculate_stock_prices(stock_id):
             ticker_id = f"{stock_id}.TWO"
             df_daily = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
     else:
+        # 支援輸入小寫大盤符號如 ^twii，自動轉大寫
         ticker_id = stock_id.upper()
         df_daily = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
 
@@ -46,7 +48,25 @@ def calculate_stock_prices(stock_id):
     if isinstance(df_daily.columns, pd.MultiIndex):
         df_daily.columns = df_daily.columns.get_level_values(0)
 
-    # ⚡ 子夜空值防禦機制：半夜遇到未開盤的空 K 棒，自動往前退一格抓有交易的日期
+    # ⚡ 獲取即時最新的現價與報價時間 (完美解決大盤延遲問題)
+    try:
+        ticker_data = yf.Ticker(ticker_id)
+        current_price = float(ticker_data.fast_info.get("last_price", df_daily.iloc[-1]["Close"]))
+        
+        # 抓取最後交易時間並轉為台灣時間格式
+        last_time_utc = ticker_data.fast_info.get("last_volume_timestamp")
+        if last_time_utc:
+            # 轉換為台灣時間
+            tw_tz = pytz.timezone("Asia/Taipei")
+            dt_tw = datetime.datetime.fromtimestamp(last_time_utc, tz=tw_tz)
+            quote_time = dt_tw.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            quote_time = datetime.datetime.now(pytz.timezone("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        current_price = float(df_daily.iloc[-1]["Close"])
+        quote_time = datetime.datetime.now(pytz.timezone("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 子夜空值防禦機制（針對歷史 K 線計算關鍵價使用）
     import numpy as np
     if pd.isna(df_daily.iloc[-1]["Close"]) or df_daily.iloc[-1]["Volume"] == 0 or np.isnan(df_daily.iloc[-1]["Close"]):
         df_daily = df_daily.iloc[:-1]
@@ -54,9 +74,10 @@ def calculate_stock_prices(stock_id):
     t_day = df_daily.iloc[-1]
     p_day = df_daily.iloc[-2]
     
-    t_h, t_l, t_c = float(t_day["High"]), float(t_day["Low"]), float(t_day["Close"])
+    t_h, t_l = float(t_day["High"]), float(t_day["Low"])
     p_h, p_l = float(p_day["High"]), float(p_day["Low"])
 
+    # 關鍵價公式計算
     t_res = t_h + (t_h - t_l) * 0.382
     t_key = (t_h + t_l) / 2
     t_sup = t_l - (t_h - t_l) * 0.382
@@ -71,18 +92,20 @@ def calculate_stock_prices(stock_id):
     df_monthly = df_daily.resample("ME").agg({"High": "max", "Low": "min"})
     m_key = float((df_monthly.iloc[-1]["High"] + df_monthly.iloc[-1]["Low"]) / 2)
 
-    # ⚡ 2. 獲取精準繁體中文股票名稱
+    # 獲取精準繁體中文股票名稱
     stock_name = ""
     if is_tw_stock:
         try:
-            # 從 twstock 內建資料庫直接撈取上市櫃官方中文名稱
             tw_info = twstock.codes.get(stock_id)
             if tw_info:
                 stock_name = tw_info.name
         except Exception:
             pass
+    elif ticker_id == "^TWII":
+        stock_name = "上市加權指數"
+    elif ticker_id == "^TWOII":
+        stock_name = "櫃買指數"
 
-    # 如果是美股或 twstock 查無此號，則改用 yfinance 的 shortName
     if not stock_name:
         try:
             ticker_data = yf.Ticker(ticker_id)
@@ -90,12 +113,12 @@ def calculate_stock_prices(stock_id):
         except Exception:
             stock_name = stock_id
 
-    # 完美格式化：3008 大立光
-    display_name = f"{stock_id} {stock_name}"
+    display_name = f"{stock_id.upper()} {stock_name}"
 
     return {
         "ticker_id": display_name,
-        "current": t_c,
+        "current": current_price,
+        "quote_time": quote_time,  # ⚡ 新增時間戳記
         "t_res": t_res, "t_key": t_key, "t_sup": t_sup,
         "p_res": p_res, "p_key": p_key, "p_sup": p_sup,
         "w_key": w_key, "m_key": m_key
@@ -142,14 +165,13 @@ def verify_signature(body, signature):
     return hmac.compare_digest(expected_signature, signature)
 
 # ==========================================
-# ✉️ LINE 訊息回覆傳送邏輯（中文版新排版）
+# ✉️ LINE 訊息回覆傳送邏輯（文字名稱優化版）
 # ==========================================
 def process_and_reply_line(reply_token, user_text):
     if user_text == "開始" or user_text.lower() == "hello":
-        send_line_reply(reply_token, "👋 歡迎使用關鍵價看盤助手！\n\n💡 請在股號前加一個『#』即可查詢。\n👉 例如輸入：`#2330` 或 `#3008`")
+        send_line_reply(reply_token, "👋 歡迎使用關鍵價看盤助手！\n\n💡 請在股號前加一個『#』即可查詢。\n👉 例如輸入：`#2330` 或 `#^TWII`")
         return
 
-    # ⚡ 檢查防洗版暗號
     if not user_text.startswith("#"):
         return
 
@@ -163,20 +185,21 @@ def process_and_reply_line(reply_token, user_text):
             send_line_reply(reply_token, f"❌ 找不到股票代號 '{stock_id}' 的資料。")
             return
 
-        # ⚡ 依照要求完美格式化輸出文字
+        # ⚡ 依照全新格式設計：加入報價時間、更換多空防守價名稱
         report_text = (
             f"🚀 【標的】：{p['ticker_id']}\n"
             f"🔥 【現價】：{p['current']:.2f}\n"
+            f"⏰ 【時間】：{p['quote_time']}\n"
             f"━━━━━━━━━━━━━\n"
             f"📊 【今日關鍵價】\n"
-            f"🟥 壓力：{p['t_res']:.2f}\n"
-            f"🔑 關鍵：{p['t_key']:.2f}\n"
-            f"🟩 支撐：{p['t_sup']:.2f}\n"
+            f"🟥 空方防守價：{p['t_res']:.2f}\n"
+            f"🔑 關鍵價：{p['t_key']:.2f}\n"
+            f"🟩 多方防守價：{p['t_sup']:.2f}\n"
             f"━━━━━━━━━━━━━\n"
             f"📊 【前日關鍵價】\n"
-            f"🟥 壓力：{p['p_res']:.2f}\n"
-            f"🔑 關鍵：{p['p_key']:.2f}\n"
-            f"🟩 支撐：{p['p_sup']:.2f}\n"
+            f"🟥 空方防守價：{p['p_res']:.2f}\n"
+            f"🔑 關鍵價：{p['p_key']:.2f}\n"
+            f"🟩 多方防守價：{p['p_sup']:.2f}\n"
             f"━━━━━━━━━━━━━\n"
             f"🔷 周關鍵價：{p['w_key']:.2f}\n"
             f"🔶 月關鍵價：{p['m_key']:.2f}"

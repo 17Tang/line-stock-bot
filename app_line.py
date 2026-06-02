@@ -45,7 +45,7 @@ def calculate_stock_prices(stock_id):
         ticker_id = stock_id.upper()
         df_daily = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
 
-    if df_daily.empty or len(df_daily) < 3:
+    if df_daily.empty or len(df_daily) < 4:
         return None
 
     if isinstance(df_daily.columns, pd.MultiIndex):
@@ -56,14 +56,70 @@ def calculate_stock_prices(stock_id):
     if pd.isna(df_daily.iloc[-1]["Close"]) or df_daily.iloc[-1]["Volume"] == 0 or np.isnan(df_daily.iloc[-1]["Close"]):
         df_daily = df_daily.iloc[:-1]
 
-    # 提取最新兩天數據以計算漲跌
-    t_day = df_daily.iloc[-1]
-    p_day = df_daily.iloc[-2]
+    # ⚡⚡⚡ 【核心大重構：大盤與個股分流處理】 ⚡⚡⚡
     
-    current_price = float(t_day["Close"])
-    yesterday_close = float(p_day["Close"])
-    
-    # 漲跌點數與百分比計算
+    if is_tw_index:
+        # ─── 台北大盤指數專用 (改用 fast_info 杜絕延遲) ───
+        try:
+            ticker_data = yf.Ticker(ticker_id)
+            f_info = ticker_data.fast_info
+            
+            # 直接抓網頁最即時的數據
+            current_price = float(f_info.get("last_price", df_daily.iloc[-1]["Close"]))
+            yesterday_close = float(f_info.get("previous_close", df_daily.iloc[-2]["Close"]))
+            
+            # 今日高低點 (若晚上 fast_info 清空了，則回退抓日K)
+            t_h = f_info.get("day_high")
+            t_l = f_info.get("day_low")
+            if t_h is None or t_l is None or np.isnan(t_h):
+                t_h, t_l = float(df_daily.iloc[-1]["High"]), float(df_daily.iloc[-1]["Low"])
+            
+            # 前日的高低點 (因為日K還沒更新今日，所以最後一根其實就是「前一日」)
+            p_h, p_l = float(df_daily.iloc[-1]["High"]), float(df_daily.iloc[-1]["Low"])
+            
+        except Exception:
+            current_price = float(df_daily.iloc[-1]["Close"])
+            yesterday_close = float(df_daily.iloc[-2]["Close"])
+            t_h, t_l = float(df_daily.iloc[-1]["High"]), float(df_daily.iloc[-1]["Low"])
+            p_h, p_l = float(df_daily.iloc[-2]["High"]), float(df_daily.iloc[-2]["Low"])
+            
+        # 大盤時間邏輯
+        if 900 <= (now_tw.hour * 100 + now_tw.minute) <= 1335:
+            quote_time = now_tw.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            if now_tw.weekday() >= 5: 
+                quote_time = f"{df_daily.index[-1].strftime('%Y-%m-%d')} 13:30:00"
+            else:
+                quote_time = f"{now_tw.strftime('%Y-%m-%d')} 13:30:00"
+                
+    else:
+        # ─── 一般個股與美股 (原本日K更新正常，維持原樣) ───
+        t_day = df_daily.iloc[-1]
+        p_day = df_daily.iloc[-2]
+        
+        current_price = float(t_day["Close"])
+        yesterday_close = float(p_day["Close"])
+        t_h, t_l = float(t_day["High"]), float(t_day["Low"])
+        p_h, p_l = float(p_day["High"]), float(p_day["Low"])
+        
+        price_date_str = df_daily.index[-1].strftime("%Y-%m-%d")
+        if is_tw_stock:
+            if price_date_str == now_tw.strftime("%Y-%m-%d") and 900 <= (now_tw.hour * 100 + now_tw.minute) <= 1335:
+                quote_time = now_tw.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                quote_time = f"{price_date_str} 13:30:00"
+        else:
+            try:
+                ticker_data = yf.Ticker(ticker_id)
+                last_time_utc = ticker_data.fast_info.get("last_volume_timestamp")
+                if last_time_utc:
+                    quote_time = datetime.datetime.fromtimestamp(last_time_utc, tz=tw_tz).strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    quote_time = f"{price_date_str} 16:00:00"
+            except Exception:
+                quote_time = f"{price_date_str} 16:00:00"
+
+    # ⚡ 漲跌點數與百分比計算
     change_points = current_price - yesterday_close
     change_percent = (change_points / yesterday_close) * 100
     
@@ -73,46 +129,6 @@ def calculate_stock_prices(stock_id):
         change_str = f"▼ {abs(change_points):.2f} (-{abs(change_percent):.2f}%)"
     else:
         change_str = f"─ 0.00 (0.00%)"
-
-    t_h, t_l = float(t_day["High"]), float(t_day["Low"])
-    p_h, p_l = float(p_day["High"]), float(p_day["Low"])
-
-    # ⚡⚡⚡ 【雙軌制精準時間修正邏輯】
-    price_date_str = df_daily.index[-1].strftime("%Y-%m-%d")
-    current_date_str = now_tw.strftime("%Y-%m-%d")
-    
-    if is_tw_index:
-        # ─── 台北大盤指數專用時間修正 ───
-        # 如果是盤中交易時間 (09:00 - 13:35)
-        if 900 <= (now_tw.hour * 100 + now_tw.minute) <= 1335:
-            quote_time = now_tw.strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            # 盤後、半夜、週末：不管 Yahoo 日 K 怎麼延遲，強制抓台北今天的日期並定格 13:30:00
-            # 如果今天是週末（週六日），則自動沿用 Yahoo 日 K 的最後交易日日期
-            if now_tw.weekday() >= 5: 
-                quote_time = f"{price_date_str} 13:30:00"
-            else:
-                quote_time = f"{current_date_str} 13:30:00"
-                
-    elif is_tw_stock:
-        # ─── 一般台股個股時間邏輯 ───
-        if price_date_str == current_date_str and 900 <= (now_tw.hour * 100 + now_tw.minute) <= 1335:
-            quote_time = now_tw.strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            quote_time = f"{price_date_str} 13:30:00"
-            
-    else:
-        # ─── 美股時間邏輯 ───
-        try:
-            ticker_data = yf.Ticker(ticker_id)
-            last_time_utc = ticker_data.fast_info.get("last_volume_timestamp")
-            if last_time_utc:
-                dt_tw = datetime.datetime.fromtimestamp(last_time_utc, tz=tw_tz)
-                quote_time = dt_tw.strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                quote_time = f"{price_date_str} 16:00:00"
-        except Exception:
-            quote_time = f"{price_date_str} 16:00:00"
 
     # 關鍵價公式計算
     t_res = t_h + (t_h - t_l) * 0.382
@@ -229,17 +245,17 @@ def process_and_reply_line(reply_token, user_text):
             f"{p['quote_time']}\n"
             f"━━━━━━━━━━━━━\n"
             f"【今日關鍵價】\n"
-            f"🟥空方防守價：{p['t_res']:.2f}\n"
-            f"🔑關鍵價：{p['t_key']:.2f}\n"
-            f"🟩多方防守價：{p['t_sup']:.2f}\n"
+            f"空方防守價：{p['t_res']:.2f}\n"
+            f"關鍵價：{p['t_key']:.2f}\n"
+            f"多方防守價：{p['t_sup']:.2f}\n"
             f"━━━━━━━━━━━━━\n"
             f"【前日關鍵價】\n"
-            f"🟥空方防守價：{p['p_res']:.2f}\n"
-            f"🔑關鍵價：{p['p_key']:.2f}\n"
-            f"🟩多方防守價：{p['p_sup']:.2f}\n"
+            f"空方防守價：{p['p_res']:.2f}\n"
+            f"關鍵價：{p['p_key']:.2f}\n"
+            f"多方防守價：{p['p_sup']:.2f}\n"
             f"━━━━━━━━━━━━━\n"
-            f"🔷周關鍵價：{p['w_key']:.2f}\n"
-            f"🔶月關鍵價：{p['m_key']:.2f}"
+            f"周關鍵價：{p['w_key']:.2f}\n"
+            f"月關鍵價：{p['m_key']:.2f}"
         )
         send_line_reply(reply_token, report_text)
     except Exception as e:

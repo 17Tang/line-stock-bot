@@ -187,16 +187,16 @@ def process_and_reply_line(reply_token, user_text):
 
         # ⚡ 依照全新格式設計：加入報價時間、更換多空防守價名稱
         report_text = (
-            f"🚀 【標的】：{p['ticker_id']}\n"
-            f"🔥 【現價】：{p['current']:.2f}\n"
-            f"⏰ 【時間】：{p['quote_time']}\n"
+            f"【標的】：{p['ticker_id']}\n"
+            f"【現價】：{p['current']:.2f}\n"
+            f"【時間】：{p['quote_time']}\n"
             f"━━━━━━━━━━━━━\n"
-            f"📊 【今日關鍵價】\n"
+            f"📊【今日關鍵價】\n"
             f"🟥 空方防守價：{p['t_res']:.2f}\n"
             f"🔑 關鍵價：{p['t_key']:.2f}\n"
             f"🟩 多方防守價：{p['t_sup']:.2f}\n"
             f"━━━━━━━━━━━━━\n"
-            f"📊 【前日關鍵價】\n"
+            f"📊【前日關鍵價】\n"
             f"🟥 空方防守價：{p['p_res']:.2f}\n"
             f"🔑 關鍵價：{p['p_key']:.2f}\n"
             f"🟩 多方防守價：{p['p_sup']:.2f}\n"

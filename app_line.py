@@ -11,7 +11,7 @@ import httpx
 import pandas as pd
 import yfinance as yf
 import twstock
-import pytz  # ⚡ 引入時區套件，確保轉換為台灣時間
+import pytz
 
 # ==========================================
 # ⚙️ 核心設定區
@@ -24,12 +24,17 @@ LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 # ==========================================
 def calculate_stock_prices(stock_id):
     days_back = 365
+    tw_tz = pytz.timezone("Asia/Taipei")
+    now_tw = datetime.datetime.now(tw_tz)
+    
     today = datetime.date.today()
     end_date = today + datetime.timedelta(days=1)
     start_date = today - datetime.timedelta(days=days_back)
 
     # 1. 判斷是否為台股（純數字代號）
     is_tw_stock = len(stock_id) >= 4 and stock_id.isdigit()
+    # 判斷是否為台股大盤指數
+    is_tw_index = stock_id.upper() in ["^TWII", "^TWOII"]
 
     if is_tw_stock:
         ticker_id = f"{stock_id}.TW"
@@ -38,7 +43,6 @@ def calculate_stock_prices(stock_id):
             ticker_id = f"{stock_id}.TWO"
             df_daily = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
     else:
-        # 支援輸入小寫大盤符號如 ^twii，自動轉大寫
         ticker_id = stock_id.upper()
         df_daily = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
 
@@ -48,25 +52,7 @@ def calculate_stock_prices(stock_id):
     if isinstance(df_daily.columns, pd.MultiIndex):
         df_daily.columns = df_daily.columns.get_level_values(0)
 
-    # ⚡ 獲取即時最新的現價與報價時間 (完美解決大盤延遲問題)
-    try:
-        ticker_data = yf.Ticker(ticker_id)
-        current_price = float(ticker_data.fast_info.get("last_price", df_daily.iloc[-1]["Close"]))
-        
-        # 抓取最後交易時間並轉為台灣時間格式
-        last_time_utc = ticker_data.fast_info.get("last_volume_timestamp")
-        if last_time_utc:
-            # 轉換為台灣時間
-            tw_tz = pytz.timezone("Asia/Taipei")
-            dt_tw = datetime.datetime.fromtimestamp(last_time_utc, tz=tw_tz)
-            quote_time = dt_tw.strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            quote_time = datetime.datetime.now(pytz.timezone("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        current_price = float(df_daily.iloc[-1]["Close"])
-        quote_time = datetime.datetime.now(pytz.timezone("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
-
-    # 子夜空值防禦機制（針對歷史 K 線計算關鍵價使用）
+    # ⚡ 子夜空值防禦機制（半夜遇到未開盤的空 K 棒，自動往前退一格）
     import numpy as np
     if pd.isna(df_daily.iloc[-1]["Close"]) or df_daily.iloc[-1]["Volume"] == 0 or np.isnan(df_daily.iloc[-1]["Close"]):
         df_daily = df_daily.iloc[:-1]
@@ -74,8 +60,34 @@ def calculate_stock_prices(stock_id):
     t_day = df_daily.iloc[-1]
     p_day = df_daily.iloc[-2]
     
+    current_price = float(t_day["Close"])
     t_h, t_l = float(t_day["High"]), float(t_day["Low"])
     p_h, p_l = float(p_day["High"]), float(p_day["Low"])
+
+    # ⚡ 【精準時間修正邏輯】
+    price_date_str = df_daily.index[-1].strftime("%Y-%m-%d")
+    
+    if is_tw_stock or is_tw_index:
+        # --- 台股與大盤時間邏輯 ---
+        # 如果歷史 K 線的日期就是今天，且現在正處於台股交易時間 (09:00 - 13:35)
+        if price_date_str == now_tw.strftime("%Y-%m-%d") and 900 <= (now_tw.hour * 100 + now_tw.minute) <= 1335:
+            # 盤中：直接顯示呼叫程式時的當前精準時間
+            quote_time = now_tw.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            # 盤後 / 夜間 / 週末：強制收盤定格在 13:30:00
+            quote_time = f"{price_date_str} 13:30:00"
+    else:
+        # --- 美股時間邏輯 (自動處理美股開盤盤中與收盤) Hades ---
+        try:
+            ticker_data = yf.Ticker(ticker_id)
+            last_time_utc = ticker_data.fast_info.get("last_volume_timestamp")
+            if last_time_utc:
+                dt_tw = datetime.datetime.fromtimestamp(last_time_utc, tz=tw_tz)
+                quote_time = dt_tw.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                quote_time = f"{price_date_str} 16:00:00"
+        except Exception:
+            quote_time = f"{price_date_str} 16:00:00"
 
     # 關鍵價公式計算
     t_res = t_h + (t_h - t_l) * 0.382
@@ -118,7 +130,7 @@ def calculate_stock_prices(stock_id):
     return {
         "ticker_id": display_name,
         "current": current_price,
-        "quote_time": quote_time,  # ⚡ 新增時間戳記
+        "quote_time": quote_time,
         "t_res": t_res, "t_key": t_key, "t_sup": t_sup,
         "p_res": p_res, "p_key": p_key, "p_sup": p_sup,
         "w_key": w_key, "m_key": m_key
@@ -165,7 +177,7 @@ def verify_signature(body, signature):
     return hmac.compare_digest(expected_signature, signature)
 
 # ==========================================
-# ✉️ LINE 訊息回覆傳送邏輯（文字名稱優化版）
+# ✉️ LINE 訊息回覆傳送邏輯
 # ==========================================
 def process_and_reply_line(reply_token, user_text):
     if user_text == "開始" or user_text.lower() == "hello":
@@ -185,7 +197,6 @@ def process_and_reply_line(reply_token, user_text):
             send_line_reply(reply_token, f"❌ 找不到股票代號 '{stock_id}' 的資料。")
             return
 
-        # ⚡ 依照全新格式設計：加入報價時間、更換多空防守價名稱
         report_text = (
             f"【標的】：{p['ticker_id']}\n"
             f"【現價】：{p['current']:.2f}\n"

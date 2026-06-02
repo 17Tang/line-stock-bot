@@ -31,7 +31,7 @@ def calculate_stock_prices(stock_id):
     end_date = today + datetime.timedelta(days=1)
     start_date = today - datetime.timedelta(days=days_back)
 
-    # 1. 判斷是否為台股（純數字代號）
+    # 1. 判斷是否為台股與大盤
     is_tw_stock = len(stock_id) >= 4 and stock_id.isdigit()
     is_tw_index = stock_id.upper() in ["^TWII", "^TWOII"]
 
@@ -56,18 +56,17 @@ def calculate_stock_prices(stock_id):
     if pd.isna(df_daily.iloc[-1]["Close"]) or df_daily.iloc[-1]["Volume"] == 0 or np.isnan(df_daily.iloc[-1]["Close"]):
         df_daily = df_daily.iloc[:-1]
 
-    # 2. 提取最新兩天數據以計算漲跌
+    # 提取最新兩天數據以計算漲跌
     t_day = df_daily.iloc[-1]
     p_day = df_daily.iloc[-2]
     
     current_price = float(t_day["Close"])
     yesterday_close = float(p_day["Close"])
     
-    # ⚡ 【漲跌點數與百分比計算核心】
+    # 漲跌點數與百分比計算
     change_points = current_price - yesterday_close
     change_percent = (change_points / yesterday_close) * 100
     
-    # 依漲跌狀況自動加上趨勢符號
     if change_points > 0:
         change_str = f"▲ {change_points:.2f} (+{change_percent:.2f}%)"
     elif change_points < 0:
@@ -78,14 +77,32 @@ def calculate_stock_prices(stock_id):
     t_h, t_l = float(t_day["High"]), float(t_day["Low"])
     p_h, p_l = float(p_day["High"]), float(p_day["Low"])
 
-    # 精準時間邏輯
+    # ⚡⚡⚡ 【雙軌制精準時間修正邏輯】
     price_date_str = df_daily.index[-1].strftime("%Y-%m-%d")
-    if is_tw_stock or is_tw_index:
-        if price_date_str == now_tw.strftime("%Y-%m-%d") and 900 <= (now_tw.hour * 100 + now_tw.minute) <= 1335:
+    current_date_str = now_tw.strftime("%Y-%m-%d")
+    
+    if is_tw_index:
+        # ─── 台北大盤指數專用時間修正 ───
+        # 如果是盤中交易時間 (09:00 - 13:35)
+        if 900 <= (now_tw.hour * 100 + now_tw.minute) <= 1335:
+            quote_time = now_tw.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            # 盤後、半夜、週末：不管 Yahoo 日 K 怎麼延遲，強制抓台北今天的日期並定格 13:30:00
+            # 如果今天是週末（週六日），則自動沿用 Yahoo 日 K 的最後交易日日期
+            if now_tw.weekday() >= 5: 
+                quote_time = f"{price_date_str} 13:30:00"
+            else:
+                quote_time = f"{current_date_str} 13:30:00"
+                
+    elif is_tw_stock:
+        # ─── 一般台股個股時間邏輯 ───
+        if price_date_str == current_date_str and 900 <= (now_tw.hour * 100 + now_tw.minute) <= 1335:
             quote_time = now_tw.strftime("%Y-%m-%d %H:%M:%S")
         else:
             quote_time = f"{price_date_str} 13:30:00"
+            
     else:
+        # ─── 美股時間邏輯 ───
         try:
             ticker_data = yf.Ticker(ticker_id)
             last_time_utc = ticker_data.fast_info.get("last_volume_timestamp")
@@ -138,7 +155,7 @@ def calculate_stock_prices(stock_id):
     return {
         "ticker_id": display_name,
         "current": current_price,
-        "change_str": change_str,  # ⚡ 新增格式化好的漲跌字串
+        "change_str": change_str,
         "quote_time": quote_time,
         "t_res": t_res, "t_key": t_key, "t_sup": t_sup,
         "p_res": p_res, "p_key": p_key, "p_sup": p_sup,
@@ -206,24 +223,23 @@ def process_and_reply_line(reply_token, user_text):
             send_line_reply(reply_token, f"❌ 找不到股票代號 '{stock_id}' 的資料。")
             return
 
-        # ⚡ 升級現價欄位輸出格式
         report_text = (
-            f"【標的】：{p['ticker_id']}\n"
-            f"【現價】：{p['current']:.2f} {p['change_str']}\n"
-            f"【時間】：{p['quote_time']}\n"
+            f"{p['ticker_id']}\n"
+            f"{p['current']:.2f} {p['change_str']}\n"
+            f"{p['quote_time']}\n"
             f"━━━━━━━━━━━━━\n"
             f"【今日關鍵價】\n"
-            f" 空方防守價：{p['t_res']:.2f}\n"
-            f" 關鍵價：{p['t_key']:.2f}\n"
-            f" 多方防守價：{p['t_sup']:.2f}\n"
+            f"🟥空方防守價：{p['t_res']:.2f}\n"
+            f"🔑關鍵價：{p['t_key']:.2f}\n"
+            f"🟩多方防守價：{p['t_sup']:.2f}\n"
             f"━━━━━━━━━━━━━\n"
             f"【前日關鍵價】\n"
-            f" 空方防守價：{p['p_res']:.2f}\n"
-            f" 關鍵價：{p['p_key']:.2f}\n"
-            f" 多方防守價：{p['p_sup']:.2f}\n"
+            f"🟥空方防守價：{p['p_res']:.2f}\n"
+            f"🔑關鍵價：{p['p_key']:.2f}\n"
+            f"🟩多方防守價：{p['p_sup']:.2f}\n"
             f"━━━━━━━━━━━━━\n"
-            f" 周關鍵價：{p['w_key']:.2f}\n"
-            f" 月關鍵價：{p['m_key']:.2f}"
+            f"🔷周關鍵價：{p['w_key']:.2f}\n"
+            f"🔶月關鍵價：{p['m_key']:.2f}"
         )
         send_line_reply(reply_token, report_text)
     except Exception as e:

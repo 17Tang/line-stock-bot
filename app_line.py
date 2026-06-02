@@ -10,9 +10,10 @@ import threading
 import httpx
 import pandas as pd
 import yfinance as yf
+import twstock  # ⚡ 引入台灣股市繁體中文資料庫
 
 # ==========================================
-# ⚙️ 核心設定區
+# ⚙️ 核心設定區（從 Render 後台安全讀取環境變數）
 # ==========================================
 LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
@@ -26,7 +27,10 @@ def calculate_stock_prices(stock_id):
     end_date = today + datetime.timedelta(days=1)
     start_date = today - datetime.timedelta(days=days_back)
 
-    if len(stock_id) >= 4 and stock_id.isdigit():
+    # 1. 判斷是否為台股（純數字代號）
+    is_tw_stock = len(stock_id) >= 4 and stock_id.isdigit()
+
+    if is_tw_stock:
         ticker_id = f"{stock_id}.TW"
         df_daily = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
         if df_daily.empty:
@@ -36,11 +40,16 @@ def calculate_stock_prices(stock_id):
         ticker_id = stock_id.upper()
         df_daily = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
 
-    if df_daily.empty or len(df_daily) < 2:
+    if df_daily.empty or len(df_daily) < 3:
         return None
 
     if isinstance(df_daily.columns, pd.MultiIndex):
         df_daily.columns = df_daily.columns.get_level_values(0)
+
+    # ⚡ 子夜空值防禦機制：半夜遇到未開盤的空 K 棒，自動往前退一格抓有交易的日期
+    import numpy as np
+    if pd.isna(df_daily.iloc[-1]["Close"]) or df_daily.iloc[-1]["Volume"] == 0 or np.isnan(df_daily.iloc[-1]["Close"]):
+        df_daily = df_daily.iloc[:-1]
 
     t_day = df_daily.iloc[-1]
     p_day = df_daily.iloc[-2]
@@ -62,8 +71,31 @@ def calculate_stock_prices(stock_id):
     df_monthly = df_daily.resample("ME").agg({"High": "max", "Low": "min"})
     m_key = float((df_monthly.iloc[-1]["High"] + df_monthly.iloc[-1]["Low"]) / 2)
 
+    # ⚡ 2. 獲取精準繁體中文股票名稱
+    stock_name = ""
+    if is_tw_stock:
+        try:
+            # 從 twstock 內建資料庫直接撈取上市櫃官方中文名稱
+            tw_info = twstock.codes.get(stock_id)
+            if tw_info:
+                stock_name = tw_info.name
+        except Exception:
+            pass
+
+    # 如果是美股或 twstock 查無此號，則改用 yfinance 的 shortName
+    if not stock_name:
+        try:
+            ticker_data = yf.Ticker(ticker_id)
+            stock_name = ticker_data.info.get("shortName", stock_id)
+        except Exception:
+            stock_name = stock_id
+
+    # 完美格式化：3008 大立光
+    display_name = f"{stock_id} {stock_name}"
+
     return {
-        "ticker_id": ticker_id, "current": t_c,
+        "ticker_id": display_name,
+        "current": t_c,
         "t_res": t_res, "t_key": t_key, "t_sup": t_sup,
         "p_res": p_res, "p_key": p_key, "p_sup": p_sup,
         "w_key": w_key, "m_key": m_key
@@ -110,14 +142,14 @@ def verify_signature(body, signature):
     return hmac.compare_digest(expected_signature, signature)
 
 # ==========================================
-# ✉️ LINE 訊息回覆傳送邏輯（防洗版暗號版）
+# ✉️ LINE 訊息回覆傳送邏輯（中文版新排版）
 # ==========================================
 def process_and_reply_line(reply_token, user_text):
     if user_text == "開始" or user_text.lower() == "hello":
-        send_line_reply(reply_token, "👋 歡迎使用關鍵價看盤助手！\n\n💡 為了防洗版，現在請在股號前加一個『#』。\n👉 例如輸入：`#2330` 或 `#AAPL` 即可查價。")
+        send_line_reply(reply_token, "👋 歡迎使用關鍵價看盤助手！\n\n💡 請在股號前加一個『#』即可查詢。\n👉 例如輸入：`#2330` 或 `#3008`")
         return
 
-    # ⚡ 檢查暗號
+    # ⚡ 檢查防洗版暗號
     if not user_text.startswith("#"):
         return
 
@@ -128,9 +160,10 @@ def process_and_reply_line(reply_token, user_text):
     try:
         p = calculate_stock_prices(stock_id)
         if p is None:
-            send_line_reply(reply_token, f"❌ 找不到股票代號 '{stock_id}' 的資料，請確認是否輸入正確。")
+            send_line_reply(reply_token, f"❌ 找不到股票代號 '{stock_id}' 的資料。")
             return
 
+        # ⚡ 依照要求完美格式化輸出文字
         report_text = (
             f"🚀 【標的】：{p['ticker_id']}\n"
             f"🔥 【現價】：{p['current']:.2f}\n"

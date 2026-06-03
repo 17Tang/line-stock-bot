@@ -23,103 +23,89 @@ LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 # 📊 數據下載與關鍵價計算邏輯
 # ==========================================
 def calculate_stock_prices(stock_id):
-    days_back = 365
     tw_tz = pytz.timezone("Asia/Taipei")
-    now_tw = datetime.datetime.now(tw_tz)
     
-    today = datetime.date.today()
-    end_date = today + datetime.timedelta(days=1)
-    start_date = today - datetime.timedelta(days=days_back)
-
     # 1. 判斷是否為台股與大盤
     is_tw_stock = len(stock_id) >= 4 and stock_id.isdigit()
     is_tw_index = stock_id.upper() in ["^TWII", "^TWOII"]
 
     if is_tw_stock:
         ticker_id = f"{stock_id}.TW"
-        df_daily = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
-        if df_daily.empty:
-            ticker_id = f"{stock_id}.TWO"
-            df_daily = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
     else:
         ticker_id = stock_id.upper()
-        df_daily = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
 
-    if df_daily.empty or len(df_daily) < 4:
+    # ⚡⚡⚡ 【終極大改版：直接下載歷史日K + 分鐘K，雙重交叉提取】 ⚡⚡⚡
+    try:
+        # 下載歷史日K線 (用來計算長線周月關鍵價、以及前一天的指標)
+        df_daily = yf.download(ticker_id, period="1mo", progress=False)
+        # 下載超精準 1分鐘K線 (用來抓取今日最新的真實報價、今日最高/最低、以及精準到分秒的時間)
+        # 抓最近 5 天以防遇到週一或連續假期
+        ticker_obj = yf.Ticker(ticker_id)
+        df_min = ticker_obj.history(period="5d", interval="1m")
+    except Exception:
         return None
 
+    if df_daily.empty or df_min.empty or len(df_daily) < 3:
+        # 如果是台股特定上市櫃板塊，改試 .TWO
+        if is_tw_stock and ticker_id.endswith(".TW"):
+            ticker_id = f"{stock_id}.TWO"
+            try:
+                df_daily = yf.download(ticker_id, period="1mo", progress=False)
+                df_min = yf.Ticker(ticker_id).history(period="5d", interval="1m")
+            except Exception:
+                return None
+        else:
+            return None
+
+    # 清理多層索引欄位
     if isinstance(df_daily.columns, pd.MultiIndex):
         df_daily.columns = df_daily.columns.get_level_values(0)
+    if isinstance(df_min.columns, pd.MultiIndex):
+        df_min.columns = df_min.columns.get_level_values(0)
 
-    # 子夜空值防禦機制（半夜遇到未開盤的空 K 棒，自動往前退一格）
+    # 🔍 【一、提取今日即時報價與精準時間】
+    # 1. 直接抓 1分鐘K線的最後一筆，這 100% 就是目前 Yahoo 擁有的最新成交價
+    latest_bar = df_min.iloc[-1]
+    current_price = float(latest_bar["Close"])
+    
+    # 2. 如實呈現這筆價格的真實撮合時間 (轉為台灣時間格式)
+    # 不論盤中 9:50、收盤 13:30，甚至 Yahoo 大盤卡住，這裡抓到幾點，時間就顯示幾點
+    raw_time = df_min.index[-1]
+    quote_time_tw = raw_time.astimezone(tw_tz)
+    quote_time = quote_time_tw.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 🔍 【二、動態抓取今日交易日與昨日交易日的 K 線數據】
+    # 取得今天這筆價格所屬的「年月日日期」字串
+    current_trade_date_str = quote_time_tw.strftime("%Y-%m-%d")
+    
+    # 將日K線重新整理
     import numpy as np
     if pd.isna(df_daily.iloc[-1]["Close"]) or df_daily.iloc[-1]["Volume"] == 0 or np.isnan(df_daily.iloc[-1]["Close"]):
         df_daily = df_daily.iloc[:-1]
 
-    # ⚡⚡⚡ 【核心大重構：大盤與個股分流處理】 ⚡⚡⚡
+    # 比對日K線最後一筆的日期是否已經是今天
+    last_daily_date_str = df_daily.index[-1].strftime("%Y-%m-%d")
     
-    if is_tw_index:
-        # ─── 台北大盤指數專用 (改用 fast_info 杜絕延遲) ───
-        try:
-            ticker_data = yf.Ticker(ticker_id)
-            f_info = ticker_data.fast_info
-            
-            # 直接抓網頁最即時的數據
-            current_price = float(f_info.get("last_price", df_daily.iloc[-1]["Close"]))
-            yesterday_close = float(f_info.get("previous_close", df_daily.iloc[-2]["Close"]))
-            
-            # 今日高低點 (若晚上 fast_info 清空了，則回退抓日K)
-            t_h = f_info.get("day_high")
-            t_l = f_info.get("day_low")
-            if t_h is None or t_l is None or np.isnan(t_h):
-                t_h, t_l = float(df_daily.iloc[-1]["High"]), float(df_daily.iloc[-1]["Low"])
-            
-            # 前日的高低點 (因為日K還沒更新今日，所以最後一根其實就是「前一日」)
-            p_h, p_l = float(df_daily.iloc[-1]["High"]), float(df_daily.iloc[-1]["Low"])
-            
-        except Exception:
-            current_price = float(df_daily.iloc[-1]["Close"])
-            yesterday_close = float(df_daily.iloc[-2]["Close"])
-            t_h, t_l = float(df_daily.iloc[-1]["High"]), float(df_daily.iloc[-1]["Low"])
-            p_h, p_l = float(df_daily.iloc[-2]["High"]), float(df_daily.iloc[-2]["Low"])
-            
-        # 大盤時間邏輯
-        if 900 <= (now_tw.hour * 100 + now_tw.minute) <= 1335:
-            quote_time = now_tw.strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            if now_tw.weekday() >= 5: 
-                quote_time = f"{df_daily.index[-1].strftime('%Y-%m-%d')} 13:30:00"
-            else:
-                quote_time = f"{now_tw.strftime('%Y-%m-%d')} 13:30:00"
-                
-    else:
-        # ─── 一般個股與美股 (原本日K更新正常，維持原樣) ───
+    if last_daily_date_str == current_trade_date_str:
+        # 狀況 A：日K已經包含今天 (個股通常是這樣)
         t_day = df_daily.iloc[-1]
         p_day = df_daily.iloc[-2]
+    else:
+        # 狀況 B：日K還卡在昨天 (大盤指數晚上最常發生！)
+        # 此時歷史日K的最後一筆其實是「前一日」，所以我們把一分鐘K整合出今天的最高最低
+        p_day = df_daily.iloc[-1]
+        # 從 1分鐘K線中，篩選出屬於今天這個交易日的所有資料，結合成今日日K
+        df_today_min = df_min[df_min.index.date == raw_time.date()]
         
-        current_price = float(t_day["Close"])
-        yesterday_close = float(p_day["Close"])
-        t_h, t_l = float(t_day["High"]), float(t_day["Low"])
-        p_h, p_l = float(p_day["High"]), float(p_day["Low"])
-        
-        price_date_str = df_daily.index[-1].strftime("%Y-%m-%d")
-        if is_tw_stock:
-            if price_date_str == now_tw.strftime("%Y-%m-%d") and 900 <= (now_tw.hour * 100 + now_tw.minute) <= 1335:
-                quote_time = now_tw.strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                quote_time = f"{price_date_str} 13:30:00"
-        else:
-            try:
-                ticker_data = yf.Ticker(ticker_id)
-                last_time_utc = ticker_data.fast_info.get("last_volume_timestamp")
-                if last_time_utc:
-                    quote_time = datetime.datetime.fromtimestamp(last_time_utc, tz=tw_tz).strftime("%Y-%m-%d %H:%M:%S")
-                else:
-                    quote_time = f"{price_date_str} 16:00:00"
-            except Exception:
-                quote_time = f"{price_date_str} 16:00:00"
+        # 建立一個虛擬的今日日K物件
+        t_day = {
+            "High": float(df_today_min["High"].max()) if not df_today_min.empty else float(p_day["High"]),
+            "Low": float(df_today_min["Low"].min()) if not df_today_min.empty else float(p_day["Low"]),
+            "Close": current_price
+        }
 
-    # ⚡ 漲跌點數與百分比計算
+    # 🔍 【三、計算漲跌幅】
+    yesterday_close = float(p_day["Close"])
     change_points = current_price - yesterday_close
     change_percent = (change_points / yesterday_close) * 100
     
@@ -130,7 +116,10 @@ def calculate_stock_prices(stock_id):
     else:
         change_str = f"─ 0.00 (0.00%)"
 
-    # 關鍵價公式計算
+    # 🔍 【四、計算公式】
+    t_h, t_l = float(t_day["High"]), float(t_day["Low"])
+    p_h, p_l = float(p_day["High"]), float(p_day["Low"])
+
     t_res = t_h + (t_h - t_l) * 0.382
     t_key = (t_h + t_l) / 2
     t_sup = t_l - (t_h - t_l) * 0.382
@@ -145,7 +134,7 @@ def calculate_stock_prices(stock_id):
     df_monthly = df_daily.resample("ME").agg({"High": "max", "Low": "min"})
     m_key = float((df_monthly.iloc[-1]["High"] + df_monthly.iloc[-1]["Low"]) / 2)
 
-    # 獲取精準繁體中文股票名稱
+    # 獲取中文名稱
     stock_name = ""
     if is_tw_stock:
         try:
@@ -154,15 +143,14 @@ def calculate_stock_prices(stock_id):
                 stock_name = tw_info.name
         except Exception:
             pass
-    elif ticker_id == "^TWII":
+    elif ticker_id.startswith("^TWII"):
         stock_name = "上市加權指數"
-    elif ticker_id == "^TWOII":
+    elif ticker_id.startswith("^TWOII"):
         stock_name = "櫃買指數"
 
     if not stock_name:
         try:
-            ticker_data = yf.Ticker(ticker_id)
-            stock_name = ticker_data.info.get("shortName", stock_id)
+            stock_name = ticker_obj.info.get("shortName", stock_id)
         except Exception:
             stock_name = stock_id
 

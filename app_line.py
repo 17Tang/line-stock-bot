@@ -27,30 +27,38 @@ yf_session.headers.update({
 })
 
 # ==========================================
-# 📊 數據下載與關鍵價計算
+# 📊 數據下載與關鍵價計算 (全資產完美相容版)
 # ==========================================
 def calculate_stock_prices(stock_id):
     days_back = 365
     today = datetime.date.today()
-    # 確保抓到最新日K
     end_date = today + datetime.timedelta(days=1)
     start_date = today - datetime.timedelta(days=days_back)
     
-    clean_target = stock_id.upper().replace("^", "").strip()
-    is_tw_index = clean_target in ["TWII", "TWOII"]
-    is_tw_stock = len(clean_target) >= 4 and clean_target.isdigit()
-
-    if is_tw_index:
-        yf_id = f"^{clean_target}"
-    elif is_tw_stock:
-        yf_id = f"{clean_target}.TW"
+    # ⚡ 核心修復：轉大寫去空白，但不亂動 ^ 符號
+    target = stock_id.upper().strip()
+    
+    # 精準分流判定：只針對台股大盤做特殊相容，其餘美股指數(如 ^SOX)原樣保留
+    if target in ["TWII", "^TWII"]:
+        yf_id = "^TWII"
+        is_tw_index = True
+        is_tw_stock = False
+    elif target in ["TWOII", "^TWOII"]:
+        yf_id = "^TWOII"
+        is_tw_index = True
+        is_tw_stock = False
     else:
-        yf_id = clean_target
+        is_tw_index = False
+        # 判定是否為純數字台股
+        is_tw_stock = target.replace(".", "").isdigit() and len(target) >= 4
+        yf_id = f"{target}.TW" if is_tw_stock else target
+
+    print(f"--- 查詢代號確認: {yf_id} ---")
 
     try:
         df_daily = yf.download(yf_id, start=start_date, end=end_date, progress=False, session=yf_session)
         if is_tw_stock and df_daily.empty:
-            yf_id = f"{clean_target}.TWO"
+            yf_id = f"{target}.TWO"
             df_daily = yf.download(yf_id, start=start_date, end=end_date, progress=False, session=yf_session)
     except Exception:
         return None
@@ -61,11 +69,10 @@ def calculate_stock_prices(stock_id):
     if isinstance(df_daily.columns, pd.MultiIndex):
         df_daily.columns = df_daily.columns.get_level_values(0)
 
-    # ⚡ 致命 Bug 修正：絕對不可檢查 Volume == 0，只檢查 Close 是否為 NaN
+    # 僅檢查 NaN 空棒，不檢查 Volume
     if pd.isna(df_daily.iloc[-1]["Close"]) or np.isnan(float(df_daily.iloc[-1]["Close"])):
         df_daily = df_daily.iloc[:-1]
 
-    # 提取數據 (完全對齊 Streamlit)
     t_day = df_daily.iloc[-1]
     p_day = df_daily.iloc[-2]
     
@@ -105,22 +112,23 @@ def calculate_stock_prices(stock_id):
 
     # 名稱轉換
     stock_name = ""
-    if is_tw_index:
-        stock_name = "上市加權指數" if clean_target == "TWII" else "櫃買指數"
+    if yf_id == "^TWII":
+        stock_name = "上市加權指數"
+    elif yf_id == "^TWOII":
+        stock_name = "櫃買指數"
     elif is_tw_stock:
         try:
-            tw_info = twstock.codes.get(clean_target)
+            tw_info = twstock.codes.get(target)
             if tw_info: stock_name = tw_info.name
         except Exception: pass
         
     if not stock_name:
         try:
-            stock_name = yf.Ticker(yf_id, session=yf_session).info.get("shortName", clean_target)
+            stock_name = yf.Ticker(yf_id, session=yf_session).info.get("shortName", target)
         except Exception:
-            stock_name = clean_target
+            stock_name = target
 
-    display_target = f"^{clean_target}" if is_tw_index else clean_target
-    display_name = f"{display_target} {stock_name}"
+    display_name = f"{yf_id} {stock_name}"
 
     return {
         "ticker_id": display_name,
@@ -170,7 +178,7 @@ def verify_signature(body, signature):
     return hmac.compare_digest(expected_signature, signature)
 
 # ==========================================
-# ✉️ LINE 訊息回覆傳送邏輯
+# ✉️ LINE 訊息回覆傳送邏輯 (維持極簡無標題)
 # ==========================================
 def process_and_reply_line(reply_token, user_text):
     if user_text == "開始" or user_text.lower() == "hello":

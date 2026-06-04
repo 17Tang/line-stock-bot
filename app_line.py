@@ -13,7 +13,6 @@ import yfinance as yf
 import twstock
 import pytz
 import requests
-import numpy as np
 
 # ==========================================
 # ⚙️ 核心設定區
@@ -28,16 +27,11 @@ yf_session.headers.update({
 })
 
 # ==========================================
-# 📊 數據下載與關鍵價計算邏輯 (盤中即時完美版)
+# 📊 數據下載與關鍵價計算邏輯 (1分鐘K線絕對精準版)
 # ==========================================
 def calculate_stock_prices(stock_id):
     tw_tz = pytz.timezone("Asia/Taipei")
-    now_tw = datetime.datetime.now(tw_tz)
     
-    # 判斷目前是否在台股盤中
-    tw_market_open = (now_tw.weekday() < 5) and (900 <= now_tw.hour * 100 + now_tw.minute <= 1335)
-    
-    # 清洗使用者輸入
     clean_target = stock_id.upper().replace("^", "").strip()
     is_tw_index = clean_target in ["TWII", "TWOII"]
     is_tw_stock = len(clean_target) >= 4 and clean_target.isdigit()
@@ -49,98 +43,65 @@ def calculate_stock_prices(stock_id):
     else:
         yf_id = clean_target
 
-    # 1. 下載歷史日K (作為歷史基底)
+    print(f"\n--- 查詢開始: {yf_id} ---")
+
     try:
+        # 1. 同時下載「歷史日K」與「即時1分鐘K」
         df_daily = yf.download(yf_id, period="3mo", progress=False, session=yf_session)
-        if is_tw_stock and df_daily.empty:
+        df_min = yf.download(yf_id, period="5d", interval="1m", progress=False, session=yf_session)
+        
+        # 台灣上市找不到，自動轉上櫃
+        if is_tw_stock and (df_daily.empty or df_min.empty):
             yf_id = f"{clean_target}.TWO"
             df_daily = yf.download(yf_id, period="3mo", progress=False, session=yf_session)
+            df_min = yf.download(yf_id, period="5d", interval="1m", progress=False, session=yf_session)
     except Exception as e:
         print(f"下載失敗: {e}")
         return None
 
-    if df_daily.empty or len(df_daily) < 5:
+    if df_daily.empty or df_min.empty or len(df_daily) < 3:
         return None
 
+    # 清理 Yahoo 回傳的多層索引 (MultiIndex)
     if isinstance(df_daily.columns, pd.MultiIndex):
         df_daily.columns = df_daily.columns.get_level_values(0)
+    if isinstance(df_min.columns, pd.MultiIndex):
+        df_min.columns = df_min.columns.get_level_values(0)
 
-    # ⚡ 核心邏輯：將「今天」的K棒與「純歷史」徹底拆開
-    if df_daily.index[-1].date() >= now_tw.date():
-        today_k = df_daily.iloc[-1]
-        df_history = df_daily.iloc[:-1]
-    else:
-        today_k = None
-        df_history = df_daily
-
-    if df_history.empty:
-        df_history = df_daily
-
-    # 基準值永遠來自昨天
-    p_day = df_history.iloc[-1]
-    yesterday_close = float(p_day["Close"])
+    # ⚡ 2. 提取「絕對真實」的報價時間與現價 (不再使用 current time 假冒)
+    # 將 1分鐘 K 線的最後一根時間，轉換為台灣時區
+    last_min_time = df_min.index[-1].astimezone(tw_tz)
+    quote_time = last_min_time.strftime("%Y-%m-%d %H:%M:%S")
+    trade_date = last_min_time.date() # 這筆價格發生的真實日期
     
-    # 預設今日參數
-    current_price = yesterday_close
-    t_h = float(p_day["High"])
-    t_l = float(p_day["Low"])
-    quote_time = None
+    # 提取精準現價
+    current_price = float(df_min.iloc[-1]["Close"])
 
-    # 2. 透過 fast_info 強制抓取「盤中即時串流」
-    try:
-        f_info = yf.Ticker(yf_id, session=yf_session).fast_info
+    # ⚡ 3. 精準切割「昨日」與「今日」的數據
+    # 確保 df_daily 的時區被清理，方便做日期比對
+    df_daily.index = pd.to_datetime(df_daily.index).tz_localize(None)
+    
+    # 嚴格定義「昨日」：日期必須小於剛剛抓到的最新 trade_date
+    past_daily = df_daily[df_daily.index.date < trade_date]
+    if past_daily.empty:
+        return None
         
-        # 即時現價
-        cp = f_info.get("last_price")
-        if cp and not pd.isna(cp):
-            current_price = float(cp)
-        elif today_k is not None and not pd.isna(today_k["Close"]):
-            current_price = float(today_k["Close"])
-            
-        # 即時今日高點
-        dh = f_info.get("day_high")
-        if dh and not pd.isna(dh) and dh > 0:
-            t_h = float(dh)
-        elif today_k is not None and not pd.isna(today_k["High"]):
-            t_h = float(today_k["High"])
-            
-        # 即時今日低點
-        dl = f_info.get("day_low")
-        if dl and not pd.isna(dl) and dl > 0:
-            t_l = float(dl)
-        elif today_k is not None and not pd.isna(today_k["Low"]):
-            t_l = float(today_k["Low"])
-            
-        # 安全機制：確保高低點必定包覆現價 (防極端數據)
-        t_h = max(t_h, current_price)
-        t_l = min(t_l, current_price)
+    p_day = past_daily.iloc[-1]
+    yesterday_close = float(p_day["Close"])
+    p_h, p_l = float(p_day["High"]), float(p_day["Low"])
 
-        # 抓取真實撮合時間
-        last_time_utc = f_info.get("last_volume_timestamp")
-        if last_time_utc:
-            qt = datetime.datetime.fromtimestamp(last_time_utc, tz=tw_tz)
-            if qt > now_tw: qt = now_tw # 絕不允許出現未來時間
-            quote_time = qt.strftime("%Y-%m-%d %H:%M:%S")
-            
-    except Exception as e:
-        print(f"fast_info 串流錯誤: {e}")
+    # 嚴格定義「今日」：從 1分鐘 K 線中，篩選出屬於 trade_date 當天的所有 K 棒
+    today_min_bars = df_min[df_min.index.astimezone(tw_tz).date == trade_date]
+    
+    # 從今日所有的分鐘 K 棒中，動態找出今天的最高與最低點 (完美解決盤中即時跳動)
+    t_h = float(today_min_bars["High"].max())
+    t_l = float(today_min_bars["Low"].min())
+    
+    # 防呆機制：確保高低點必定包覆現價
+    t_h = max(t_h, current_price)
+    t_l = min(t_l, current_price)
 
-    # ⚡ 終極時間防禦機制：解決未來時間與顯示當下時間的需求
-    if not quote_time:
-        if is_tw_stock or is_tw_index:
-            if tw_market_open:
-                # 盤中：若抓不到撮合時間，直接顯示當下查詢的真實時間！
-                quote_time = now_tw.strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                # 盤後：若有交易，定格今日 13:30；若無，定格昨日 13:30
-                if current_price != yesterday_close or today_k is not None:
-                    quote_time = f"{now_tw.strftime('%Y-%m-%d')} 13:30:00"
-                else:
-                    quote_time = f"{df_history.index[-1].strftime('%Y-%m-%d')} 13:30:00"
-        else:
-            quote_time = f"{df_history.index[-1].strftime('%Y-%m-%d')} 16:00:00"
-
-    # 3. 漲跌與關鍵價計算
+    # 4. 漲跌點數與百分比計算
     change_points = current_price - yesterday_close
     change_percent = (change_points / yesterday_close) * 100
     
@@ -151,24 +112,30 @@ def calculate_stock_prices(stock_id):
     else:
         change_str = f"─ 0.00 (0.00%)"
 
-    # 今日關鍵價 (盤中會隨 t_h, t_l 動態變化)
+    # 5. 關鍵價核心公式
+    # 今日關鍵價 (盤中會隨 t_h, t_l 即時跳動)
     t_res = t_h + (t_h - t_l) * 0.382
     t_key = (t_h + t_l) / 2
     t_sup = t_l - (t_h - t_l) * 0.382
 
     # 前日關鍵價 (絕對死鎖在昨日數據)
-    p_h, p_l = float(p_day["High"]), float(p_day["Low"])
     p_res = p_h + (p_h - p_l) * 0.382
     p_key = (p_h + p_l) / 2
     p_sup = p_l - (p_h - p_l) * 0.382
 
-    df_weekly = df_daily.resample("W-FRI").agg({"High": "max", "Low": "min"})
+    # 6. 周月線計算 (將今日即時K棒組合進歷史，確保周月線不斷層)
+    new_row = pd.DataFrame({
+        "High": [t_h], "Low": [t_l]
+    }, index=[pd.Timestamp(trade_date)])
+    full_daily = pd.concat([past_daily, new_row])
+
+    df_weekly = full_daily.resample("W-FRI").agg({"High": "max", "Low": "min"}).dropna()
     w_key = float((df_weekly.iloc[-1]["High"] + df_weekly.iloc[-1]["Low"]) / 2)
 
-    df_monthly = df_daily.resample("ME").agg({"High": "max", "Low": "min"})
+    df_monthly = full_daily.resample("ME").agg({"High": "max", "Low": "min"}).dropna()
     m_key = float((df_monthly.iloc[-1]["High"] + df_monthly.iloc[-1]["Low"]) / 2)
 
-    # 4. 名稱轉換
+    # 7. 名稱轉換
     stock_name = ""
     if is_tw_index:
         stock_name = "上市加權指數" if clean_target == "TWII" else "櫃買指數"
@@ -260,37 +227,4 @@ def process_and_reply_line(reply_token, user_text):
             f"{p['current']:.2f} {p['change_str']}\n"
             f"{p['quote_time']}\n"
             f"━━━━━━━━━━━━━\n"
-            f"【今日關鍵價】\n"
-            f"空方防守價：{p['t_res']:.2f}\n"
-            f"關鍵價：{p['t_key']:.2f}\n"
-            f"多方防守價：{p['t_sup']:.2f}\n"
-            f"━━━━━━━━━━━━━\n"
-            f"【前日關鍵價】\n"
-            f"空方防守價：{p['p_res']:.2f}\n"
-            f"關鍵價：{p['p_key']:.2f}\n"
-            f"多方防守價：{p['p_sup']:.2f}\n"
-            f"━━━━━━━━━━━━━\n"
-            f"周關鍵價：{p['w_key']:.2f}\n"
-            f"月關鍵價：{p['m_key']:.2f}"
-        )
-        send_line_reply(reply_token, report_text)
-    except Exception as e:
-        print(f"LINE 回覆出錯: {e}")
-        send_line_reply(reply_token, "❌ 系統計算發生錯誤，請稍後再試。")
-
-def send_line_reply(reply_token, text):
-    url = "https://api.line.me/v2/bot/message/reply"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_ACCESS_TOKEN}"
-    }
-    payload = {
-        "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text}]
-    }
-    httpx.post(url, json=payload, headers=headers)
-
-if __name__ == "__main__":
-    server = http.server.HTTPServer(('0.0.0.0', 10000), LineWebhookHandler)
-    print("🟢 LINE 機器人 Webhook 伺服器已在連接埠 10000 啟動...")
-    server.serve_forever()
+            f"

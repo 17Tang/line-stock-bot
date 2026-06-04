@@ -20,175 +20,87 @@ import requests
 LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 
-# ⚡ 核心修復 1：建立偽裝瀏覽器的 Session，大幅降低 Yahoo 封鎖機率 (Rate Limit)
+# ⚡ 防封鎖偽裝：避免 Yahoo API 拒絕連線
 yf_session = requests.Session()
 yf_session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 })
 
 # ==========================================
-# 📊 數據下載與關鍵價計算邏輯
+# 📊 數據下載與關鍵價計算邏輯 (穩定統一版)
 # ==========================================
 def calculate_stock_prices(stock_id):
     tw_tz = pytz.timezone("Asia/Taipei")
-    now_tw = datetime.datetime.now(tw_tz)
     
-    target = stock_id.upper().strip()
+    # 1. 統一清理使用者輸入 (容許有沒有 ^ 都能查)
+    clean_target = stock_id.upper().replace("^", "").strip()
     
-    # ⚡ 核心修復 2：精準判斷邏輯，絕不誤殺美股指數 (^SOX 等)
-    if target in ["TWII", "^TWII"]:
-        yf_id = "^TWII"
-        is_tw_index = True
-        is_tw_stock = False
-    elif target in ["TWOII", "^TWOII"]:
-        yf_id = "^TWOII"
-        is_tw_index = True
-        is_tw_stock = False
-    else:
-        is_tw_index = False
-        is_tw_stock = len(target) >= 4 and target.replace(".", "").isdigit()
-        yf_id = f"{target}.TW" if is_tw_stock else target
+    is_tw_index = clean_target in ["TWII", "TWOII"]
+    is_tw_stock = len(clean_target) >= 4 and clean_target.isdigit()
 
-    print(f"\n================ [ 測試日誌啟動 ] ================")
-    print(f"原始輸入: {stock_id} | 轉換後 YF 代號: {yf_id}")
-    print(f"大盤指數判定: {is_tw_index} | 台灣個股判定: {is_tw_stock}")
-
-    # ⚡⚡⚡ 【第一部分：大盤指數獨立撰寫邏輯】 ⚡⚡⚡
+    # 2. 設定給 yfinance 的標準代號
     if is_tw_index:
-        try:
-            # 加入 session 避免被擋
-            df_index_hist = yf.download(yf_id, period="1mo", progress=False, session=yf_session)
-            if isinstance(df_index_hist.columns, pd.MultiIndex):
-                df_index_hist.columns = df_index_hist.columns.get_level_values(0)
-                
-            if not df_index_hist.empty and df_index_hist.index[-1].strftime("%Y-%m-%d") == now_tw.strftime("%Y-%m-%d"):
-                df_index_hist = df_index_hist.iloc[:-1]
-                
-            p_day = df_index_hist.iloc[-1]
-            yesterday_close = float(p_day["Close"])
-            p_h = float(p_day["High"])
-            p_l = float(p_day["Low"])
-            
-            rt_id = "tse_^TWII" if yf_id == "^TWII" else "otc_^TWOII"
-            rt_data = twstock.realtime.get(rt_id)
-            
-            if rt_data and rt_data.get('success'):
-                info = rt_data['info']
-                realtime_info = rt_data['realtime']
-                
-                time_str = info.get('time', '')
-                quote_time = datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S") if time_str else f"{df_index_hist.index[-1].strftime('%Y-%m-%d')} 13:30:00"
-                
-                current_price = realtime_info.get('latest_trade_price')
-                t_h = realtime_info.get('high')
-                t_l = realtime_info.get('low')
-                open_price = realtime_info.get('open')
-                
-                import numpy as np
-                if current_price is None or current_price == '-' or np.isnan(float(current_price)): current_price = open_price if open_price and open_price != '-' else yesterday_close
-                if t_h is None or t_h == '-' or np.isnan(float(t_h)): t_h = current_price
-                if t_l is None or t_l == '-' or np.isnan(float(t_l)): t_l = current_price
-                
-                current_price = float(current_price)
-                t_h = float(t_h)
-                t_l = float(t_l)
-            else:
-                current_price = yesterday_close
-                t_h = float(df_index_hist.iloc[-1]["High"])
-                t_l = float(df_index_hist.iloc[-1]["Low"])
-                quote_time = f"{df_index_hist.index[-1].strftime('%Y-%m-%d')} 13:30:00"
-            
-            display_name = "上市加權指數" if yf_id == "^TWII" else "櫃買指數"
-            display_name = f"{yf_id} {display_name}"
-            
-        except Exception as e:
-            print(f"❌ 指數通道崩潰: {e}")
-            return None
-
-    # ⚡⚡⚡ 【第二部分：一般個股/美股獨立撰寫邏輯】 ⚡⚡⚡
+        yf_id = f"^{clean_target}"
+    elif is_tw_stock:
+        yf_id = f"{clean_target}.TW"
     else:
-        try:
+        yf_id = clean_target
+
+    print(f"--- 查詢開始: {yf_id} ---")
+
+    # 3. 統一使用最穩定的 yfinance 下載歷史日 K
+    try:
+        df_daily = yf.download(yf_id, period="1mo", progress=False, session=yf_session)
+        # 如果台股上市找不到，嘗試上櫃
+        if is_tw_stock and df_daily.empty:
+            yf_id = f"{clean_target}.TWO"
             df_daily = yf.download(yf_id, period="1mo", progress=False, session=yf_session)
-            if is_tw_stock and df_daily.empty:
-                yf_id = f"{target}.TWO"
-                df_daily = yf.download(yf_id, period="1mo", progress=False, session=yf_session)
-        except Exception as e:
-            print(f"❌ 歷史日K線下載失敗: {e}")
-            return None
+    except Exception as e:
+        print(f"下載失敗: {e}")
+        return None
 
-        if df_daily.empty or len(df_daily) < 3:
-            print(f"❌ {yf_id} 找不到歷史日K數據，可能遭限流或代號錯誤")
-            return None
+    if df_daily.empty or len(df_daily) < 3:
+        print("數據筆數不足")
+        return None
 
-        if isinstance(df_daily.columns, pd.MultiIndex):
-            df_daily.columns = df_daily.columns.get_level_values(0)
+    if isinstance(df_daily.columns, pd.MultiIndex):
+        df_daily.columns = df_daily.columns.get_level_values(0)
 
-        import numpy as np
-        if pd.isna(df_daily.iloc[-1]["Close"]) or df_daily.iloc[-1]["Volume"] == 0 or np.isnan(df_daily.iloc[-1]["Close"]):
-            df_daily = df_daily.iloc[:-1]
+    # 換日空值防禦
+    import numpy as np
+    if pd.isna(df_daily.iloc[-1]["Close"]) or df_daily.iloc[-1]["Volume"] == 0 or np.isnan(df_daily.iloc[-1]["Close"]):
+        df_daily = df_daily.iloc[:-1]
 
-        if is_tw_stock:
-            try:
-                rt_id = f"otc_{target}.tw" if yf_id.endswith(".TWO") else f"tse_{target}.tw"
-                rt_data = twstock.realtime.get(rt_id)
-                if rt_data and rt_data.get('success'):
-                    realtime_info = rt_data['realtime']
-                    current_price = realtime_info.get('latest_trade_price')
-                    if current_price is None or current_price == '-' or np.isnan(float(current_price)):
-                        current_price = df_daily.iloc[-1]["Close"]
-                    current_price = float(current_price)
-                    
-                    time_str = rt_data['info'].get('time', '')
-                    quote_time = datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S") if time_str else f"{df_daily.index[-1].strftime('%Y-%m-%d')} 13:30:00"
-                else:
-                    raise Exception()
-            except Exception:
-                current_price = float(df_daily.iloc[-1]["Close"])
-                quote_time = f"{df_daily.index[-1].strftime('%Y-%m-%d')} 13:30:00"
+    # 4. 提取基準數據 (無論指數或個股，都以 df_daily 為最穩定的基底)
+    t_day = df_daily.iloc[-1]
+    p_day = df_daily.iloc[-2]
+    
+    current_price = float(t_day["Close"])
+    yesterday_close = float(p_day["Close"])
+    t_h, t_l = float(t_day["High"]), float(t_day["Low"])
+    p_h, p_l = float(p_day["High"]), float(p_day["Low"])
+    
+    # 時間統一以 K 棒日期為準，定格 13:30 (美股 16:00)
+    price_date_str = df_daily.index[-1].strftime("%Y-%m-%d")
+    quote_time = f"{price_date_str} 16:00:00" if not (is_tw_stock or is_tw_index) else f"{price_date_str} 13:30:00"
+
+    # ⚡ (選擇性) 僅針對台股個股，安全地疊加即時報價，若失敗絕不當機
+    if is_tw_stock:
+        try:
+            rt_id = f"otc_{clean_target}.tw" if yf_id.endswith(".TWO") else f"tse_{clean_target}.tw"
+            rt_data = twstock.realtime.get(rt_id)
+            if rt_data and rt_data.get('success'):
+                cp = rt_data['realtime'].get('latest_trade_price')
+                if cp and cp != '-':
+                    current_price = float(cp)
                 
-            yesterday_close = float(df_daily.iloc[-2]["Close"])
-            t_day = df_daily.iloc[-1]
-            p_day = df_daily.iloc[-2]
-            t_h, t_l = float(t_day["High"]), float(t_day["Low"])
-            p_h, p_l = float(p_day["High"]), float(p_day["Low"])
-        else:
-            # 美股與其他資產
-            t_day = df_daily.iloc[-1]
-            p_day = df_daily.iloc[-2]
-            current_price = float(t_day["Close"])
-            yesterday_close = float(p_day["Close"])
-            t_h, t_l = float(t_day["High"]), float(t_day["Low"])
-            p_h, p_l = float(p_day["High"]), float(p_day["Low"])
-            
-            # 使用 Ticker 加速獲取時間 (一樣掛上偽裝 session)
-            try:
-                ticker_obj = yf.Ticker(yf_id, session=yf_session)
-                last_time_utc = ticker_obj.fast_info.get("last_volume_timestamp")
-                if last_time_utc:
-                    quote_time = datetime.datetime.fromtimestamp(last_time_utc, tz=tw_tz).strftime("%Y-%m-%d %H:%M:%S")
-                else:
-                    quote_time = df_daily.index[-1].strftime("%Y-%m-%d 16:00:00")
-            except:
-                quote_time = df_daily.index[-1].strftime("%Y-%m-%d 16:00:00")
+                time_str = rt_data['info'].get('time', '')
+                if time_str:
+                    quote_time = datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass # 發生任何錯誤都直接忽略，沿用上面最穩定的 df_daily 數據
 
-        stock_name = ""
-        if is_tw_stock:
-            try:
-                tw_info = twstock.codes.get(target)
-                if tw_info: stock_name = tw_info.name
-            except Exception: pass
-        if not stock_name:
-            try:
-                stock_name = yf.Ticker(yf_id, session=yf_session).info.get("shortName", target)
-            except Exception: stock_name = target
-            
-        display_name = f"{target} {stock_name}" if not is_tw_index else display_name # 指數已經處理過名字了
-
-    print(f"--- 計算檢查點 ---")
-    print(f"標的: {display_name} | 現價: {current_price} | 時間: {quote_time}")
-    print(f"================================================\n")
-
-    # ⚡⚡⚡ 【第三部分：統一核心數學計算與周月線】 ⚡⚡⚡
+    # 5. 漲跌與關鍵價計算
     change_points = current_price - yesterday_close
     change_percent = (change_points / yesterday_close) * 100
     
@@ -207,12 +119,31 @@ def calculate_stock_prices(stock_id):
     p_key = (p_h + p_l) / 2
     p_sup = p_l - (p_h - p_l) * 0.382
 
-    hist_df = df_index_hist if is_tw_index else df_daily
-    df_weekly = hist_df.resample("W-FRI").agg({"High": "max", "Low": "min"})
+    df_weekly = df_daily.resample("W-FRI").agg({"High": "max", "Low": "min"})
     w_key = float((df_weekly.iloc[-1]["High"] + df_weekly.iloc[-1]["Low"]) / 2)
 
-    df_monthly = hist_df.resample("ME").agg({"High": "max", "Low": "min"})
+    df_monthly = df_daily.resample("ME").agg({"High": "max", "Low": "min"})
     m_key = float((df_monthly.iloc[-1]["High"] + df_monthly.iloc[-1]["Low"]) / 2)
+
+    # 6. 名稱轉換
+    stock_name = ""
+    if is_tw_index:
+        stock_name = "上市加權指數" if clean_target == "TWII" else "櫃買指數"
+    elif is_tw_stock:
+        try:
+            tw_info = twstock.codes.get(clean_target)
+            if tw_info: stock_name = tw_info.name
+        except Exception: pass
+        
+    if not stock_name:
+        try:
+            stock_name = yf.Ticker(yf_id, session=yf_session).info.get("shortName", clean_target)
+        except Exception:
+            stock_name = clean_target
+
+    # 指數顯示加上 ^ 比較好辨認
+    display_target = f"^{clean_target}" if is_tw_index else clean_target
+    display_name = f"{display_target} {stock_name}"
 
     return {
         "ticker_id": display_name,
@@ -262,7 +193,7 @@ def verify_signature(body, signature):
     return hmac.compare_digest(expected_signature, signature)
 
 # ==========================================
-# ✉️ LINE 訊息回覆傳送邏輯 (純粹極簡版)
+# ✉️ LINE 訊息回覆傳送邏輯
 # ==========================================
 def process_and_reply_line(reply_token, user_text):
     if user_text == "開始" or user_text.lower() == "hello":
@@ -279,10 +210,10 @@ def process_and_reply_line(reply_token, user_text):
     try:
         p = calculate_stock_prices(stock_id)
         if p is None:
-            # ⚡ 提示增加防呆，讓使用者知道可能是被限流了
             send_line_reply(reply_token, f"❌ 找不到 '{stock_id}' 的資料，或伺服器目前遭限流，請稍後再試。")
             return
 
+        # ⚡ 完全移除標題、Emoji，保留最精簡結構
         report_text = (
             f"{p['ticker_id']}\n"
             f"{p['current']:.2f} {p['change_str']}\n"

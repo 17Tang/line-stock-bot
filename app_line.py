@@ -26,6 +26,7 @@ def calculate_stock_prices(stock_id):
     tw_tz = pytz.timezone("Asia/Taipei")
     now_tw = datetime.datetime.now(tw_tz)
     
+    # ⚡ 強制轉換大寫，徹底解決大小寫不相容找不到資料的問題
     target = stock_id.upper().strip()
     is_tw_index = target in ["^TWII", "^TWOII"]
     is_tw_stock = len(target) >= 4 and target.isdigit()
@@ -33,7 +34,6 @@ def calculate_stock_prices(stock_id):
     # ⚡⚡⚡ 【第一部分：大盤指數獨立撰寫邏輯】 ⚡⚡⚡
     if is_tw_index:
         try:
-            # 1. 定義官方即時 ID
             rt_id = "tse_^TWII" if target == "^TWII" else "otc_^TWOII"
             rt_data = twstock.realtime.get(rt_id)
             
@@ -43,35 +43,31 @@ def calculate_stock_prices(stock_id):
             info = rt_data['info']
             realtime_info = rt_data['realtime']
             
-            # 2. 提取最即時的官方撮合時間與價格 (撮合到幾點就顯示幾點，絕不偽造)
             time_str = info.get('time', '')
             if time_str:
                 quote_time = datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S")
             else:
                 quote_time = now_tw.strftime("%Y-%m-%d %H:%M:%S")
                 
-            # 3. 提取今日即時高、低、現價
             current_price = realtime_info.get('latest_trade_price')
             t_h = realtime_info.get('high')
             t_l = realtime_info.get('low')
             open_price = realtime_info.get('open')
             
-            # 安全防禦：如果開盤前或剛開盤數據不齊，從其他欄位遞補
-            if current_price is None or current_price == '-': current_price = open_price
-            if t_h is None or t_h == '-': t_h = current_price
-            if t_l is None or t_l == '-': t_l = current_price
+            import numpy as np
+            if current_price is None or current_price == '-' or np.isnan(float(current_price)): current_price = open_price
+            if t_h is None or t_h == '-' or np.isnan(float(t_h)): t_h = current_price
+            if t_l is None or t_l == '-' or np.isnan(float(t_l)): t_l = current_price
             
             current_price = float(current_price)
             t_h = float(t_h)
             t_l = float(t_l)
             
-            # 4. 指數歷史數據獨立抓取 (改用 yfinance 專門針對指數的歷史區間，不跟個股混用)
+            # 指數歷史數據
             df_index_hist = yf.download(target, period="1mo", progress=False)
             if isinstance(df_index_hist.columns, pd.MultiIndex):
                 df_index_hist.columns = df_index_hist.columns.get_level_values(0)
                 
-            # 排除今天尚未定案的歷史 K 棒
-            import numpy as np
             if df_index_hist.index[-1].strftime("%Y-%m-%d") == now_tw.strftime("%Y-%m-%d"):
                 df_index_hist = df_index_hist.iloc[:-1]
                 
@@ -83,8 +79,7 @@ def calculate_stock_prices(stock_id):
             display_name = "上市加權指數" if target == "^TWII" else "櫃買指數"
             display_name = f"{target} {display_name}"
             
-        except Exception as e:
-            print(f"指數計算發生異常: {e}")
+        except Exception:
             return None
 
     # ⚡⚡⚡ 【第二部分：一般個股/美股獨立撰寫邏輯】 ⚡⚡⚡
@@ -104,20 +99,18 @@ def calculate_stock_prices(stock_id):
         if isinstance(df_daily.columns, pd.MultiIndex):
             df_daily.columns = df_daily.columns.get_level_values(0)
 
-        # 換日防禦
         import numpy as np
         if pd.isna(df_daily.iloc[-1]["Close"]) or df_daily.iloc[-1]["Volume"] == 0 or np.isnan(df_daily.iloc[-1]["Close"]):
             df_daily = df_daily.iloc[:-1]
 
         if is_tw_stock:
-            # 台灣個股改用 twstock 抓最精準的撮合時間與價格
             try:
                 rt_id = f"otc_{target}.tw" if ticker_id.endswith(".TWO") else f"tse_{target}.tw"
                 rt_data = twstock.realtime.get(rt_id)
                 if rt_data and rt_data.get('success'):
                     realtime_info = rt_data['realtime']
                     current_price = realtime_info.get('latest_trade_price')
-                    if current_price is None or current_price == '-':
+                    if current_price is None or current_price == '-' or np.isnan(float(current_price)):
                         current_price = df_daily.iloc[-1]["Close"]
                     current_price = float(current_price)
                     
@@ -135,7 +128,6 @@ def calculate_stock_prices(stock_id):
             t_h, t_l = float(t_day["High"]), float(t_day["Low"])
             p_h, p_l = float(p_day["High"]), float(p_day["Low"])
         else:
-            # 美股處理邏輯
             t_day = df_daily.iloc[-1]
             p_day = df_daily.iloc[-2]
             current_price = float(t_day["Close"])
@@ -144,7 +136,6 @@ def calculate_stock_prices(stock_id):
             p_h, p_l = float(p_day["High"]), float(p_day["Low"])
             quote_time = df_daily.index[-1].strftime("%Y-%m-%d 16:00:00")
 
-        # 獲取個股中文名稱
         stock_name = ""
         if is_tw_stock:
             try:
@@ -159,7 +150,6 @@ def calculate_stock_prices(stock_id):
         display_name = f"{target} {stock_name}"
 
     # ⚡⚡⚡ 【第三部分：統一核心數學計算與周月線】 ⚡⚡⚡
-    # 漲跌計算
     change_points = current_price - yesterday_close
     change_percent = (change_points / yesterday_close) * 100
     
@@ -170,7 +160,6 @@ def calculate_stock_prices(stock_id):
     else:
         change_str = f"─ 0.00 (0.00%)"
 
-    # 關鍵價公式
     t_res = t_h + (t_h - t_l) * 0.382
     t_key = (t_h + t_l) / 2
     t_sup = t_l - (t_h - t_l) * 0.382
@@ -179,7 +168,6 @@ def calculate_stock_prices(stock_id):
     p_key = (p_h + p_l) / 2
     p_sup = p_l - (p_h - p_l) * 0.382
 
-    # 周月線依然由穩定的歷史日K庫計算
     hist_df = df_index_hist if is_tw_index else df_daily
     df_weekly = hist_df.resample("W-FRI").agg({"High": "max", "Low": "min"})
     w_key = float((df_weekly.iloc[-1]["High"] + df_weekly.iloc[-1]["Low"]) / 2)
@@ -210,16 +198,13 @@ class LineWebhookHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         content_length = int(self.headers['Content-Length'])
         post_data = self.rfile.read(content_length)
-        
         signature = self.headers.get('X-Line-Signature', '')
         if not verify_signature(post_data, signature):
             self.send_response(400)
             self.end_headers()
             return
-
         self.send_response(200)
         self.end_headers()
-
         try:
             body = json.loads(post_data.decode('utf-8'))
             for event in body.get('events', []):
@@ -238,11 +223,11 @@ def verify_signature(body, signature):
     return hmac.compare_digest(expected_signature, signature)
 
 # ==========================================
-# ✉️ LINE 訊息回覆傳送邏輯
+# ✉️ LINE 訊息回覆傳送邏輯 (純文字無圖標乾淨版)
 # ==========================================
 def process_and_reply_line(reply_token, user_text):
     if user_text == "開始" or user_text.lower() == "hello":
-        send_line_reply(reply_token, "👋 歡迎使用關鍵價看盤助手！\n\n💡 請在股號前加一個『#』即可查詢。\n👉 例如輸入：`#2330` 或 `#^TWII`")
+        send_line_reply(reply_token, "歡迎使用關鍵價看盤助手！\n\n💡 請在股號前加一個『#』即可查詢。\n👉 例如輸入：#2330 或 #^TWII")
         return
 
     if not user_text.startswith("#"):
@@ -258,6 +243,7 @@ def process_and_reply_line(reply_token, user_text):
             send_line_reply(reply_token, f"❌ 找不到股票代號 '{stock_id}' 的資料。")
             return
 
+        # ⚡ 移除所有 Emoji 圖標，保持純粹與低調質感
         report_text = (
             f"{p['ticker_id']}\n"
             f"{p['current']:.2f} {p['change_str']}\n"

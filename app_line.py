@@ -10,7 +10,7 @@ import threading
 import httpx
 import pandas as pd
 import yfinance as yf
-import twstock  # ⚡ 台灣股市官方即時與中文名稱核心庫
+import twstock
 import pytz
 
 # ==========================================
@@ -20,120 +20,146 @@ LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 
 # ==========================================
-# 📊 數據下載與關鍵價計算邏輯
+# 📊 數據下載與關鍵價計算邏輯 (指數與個股完全獨立)
 # ==========================================
 def calculate_stock_prices(stock_id):
     tw_tz = pytz.timezone("Asia/Taipei")
     now_tw = datetime.datetime.now(tw_tz)
     
-    # 判斷是否為台股與大盤
-    is_tw_stock = len(stock_id) >= 4 and stock_id.isdigit()
-    is_tw_index = stock_id.upper() in ["^TWII", "^TWOII"]
+    target = stock_id.upper().strip()
+    is_tw_index = target in ["^TWII", "^TWOII"]
+    is_tw_stock = len(target) >= 4 and target.isdigit()
 
-    # 1. 統一轉換成 yfinance 歷史日K需要的 Ticker ID
-    if is_tw_stock:
-        ticker_id = f"{stock_id}.TW"
-    else:
-        ticker_id = stock_id.upper()
-
-    # ⚡ 2. 歷史日K線下載 (專門用來計算前日、今日、周、月的關鍵價)
-    try:
-        # 為了保證能抓到昨天的完整日K，多給一點緩衝天數
-        end_date = now_tw.date() + datetime.timedelta(days=1)
-        start_date = now_tw.date() - datetime.timedelta(days=365)
-        df_daily = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
-        
-        # 若台股上市找不到，自動切換至上櫃 (.TWO)
-        if is_tw_stock and df_daily.empty:
-            ticker_id = f"{stock_id}.TWO"
-            df_daily = yf.download(ticker_id, start=start_date, end=end_date, progress=False)
-    except Exception:
-        return None
-
-    if df_daily.empty or len(df_daily) < 3:
-        return None
-
-    # 清理日K多層索引欄位
-    if isinstance(df_daily.columns, pd.MultiIndex):
-        df_daily.columns = df_daily.columns.get_level_values(0)
-
-    # 子夜空值防禦機制（若當天剛換日遇到未開盤的空 K 棒，自動往前退一格）
-    import numpy as np
-    if pd.isna(df_daily.iloc[-1]["Close"]) or df_daily.iloc[-1]["Volume"] == 0 or np.isnan(df_daily.iloc[-1]["Close"]):
-        df_daily = df_daily.iloc[:-1]
-
-    # ⚡⚡⚡ 【三、台股 / 大盤改用 twstock 官方即時 API 交叉抓取】 ⚡⚡⚡
-    
-    if is_tw_stock or is_tw_index:
+    # ⚡⚡⚡ 【第一部分：大盤指數獨立撰寫邏輯】 ⚡⚡⚡
+    if is_tw_index:
         try:
-            # 轉換 twstock 專用的代號名稱 (大盤上市為 'tse_^TWII'，上櫃為 'otc_^TWOII')
-            if ticker_id == "^TWII":
-                rt_id = "tse_^TWII"
-            elif ticker_id == "^TWOII":
-                rt_id = "otc_^TWOII"
-            elif ticker_id.endswith(".TWO"):
-                rt_id = f"otc_{stock_id}.tw"
-            else:
-                rt_id = f"tse_{stock_id}.tw"
-                
+            # 1. 定義官方即時 ID
+            rt_id = "tse_^TWII" if target == "^TWII" else "otc_^TWOII"
             rt_data = twstock.realtime.get(rt_id)
             
-            if rt_data and rt_data.get('success'):
-                info = rt_data['info']
-                realtime_info = rt_data['realtime']
+            if not rt_data or not rt_data.get('success'):
+                return None
                 
-                # A. 提取 100% 真實即時現價 (若盤中為最新撮合價，若盤後為收盤價)
-                # 優先抓 latest_trade_price，抓不到(例如開盤前)就抓昨日收盤
-                current_price = realtime_info.get('latest_trade_price')
-                if current_price is None or current_price == '-' or np.isnan(float(current_price)):
-                    current_price = float(realtime_info.get('open', df_daily.iloc[-1]["Close"]))
-                else:
-                    current_price = float(current_price)
-                
-                # B. 提取昨日官方收盤價以精準計算漲跌
-                yesterday_close = float(df_daily.iloc[-2]["Close"])
-                
-                # C. 提取證交所官方精準撮合時間 (格式: 2026-06-03 13:30:00)
-                # twstock 的 time 欄位已經自動幫我們處理好台股收盤或盤中的即時時間了！
-                time_str = info.get('time', '')
-                if time_str:
-                    # 格式轉換成標準格式
-                    dt_parsed = datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-                    quote_time = dt_parsed.strftime("%Y-%m-%d %H:%M:%S")
-                else:
-                    quote_time = f"{df_daily.index[-1].strftime('%Y-%m-%d')} 13:30:00"
-            else:
-                raise Exception("twstock 抓取失敗，回退至 yfinance 備用機制")
-                
-        except Exception:
-            # 備用機制：若 twstock 網路超時，回退至 yfinance
-            current_price = float(df_daily.iloc[-1]["Close"])
-            yesterday_close = float(df_daily.iloc[-2]["Close"])
-            quote_time = f"{df_daily.index[-1].strftime('%Y-%m-%d')} 13:30:00"
+            info = rt_data['info']
+            realtime_info = rt_data['realtime']
             
-        # 關鍵價日K對照：此時日K的最後一筆(iloc[-1]) 就是今日(或最新交易日)，倒數第二筆(iloc[-2])就是前一日
-        t_day = df_daily.iloc[-1]
-        p_day = df_daily.iloc[-2]
-        
-    else:
-        # ─── 美股標準處理邏輯 ───
-        t_day = df_daily.iloc[-1]
-        p_day = df_daily.iloc[-2]
-        current_price = float(t_day["Close"])
-        yesterday_close = float(p_day["Close"])
-        
-        price_date_str = df_daily.index[-1].strftime("%Y-%m-%d")
-        try:
-            ticker_data = yf.Ticker(ticker_id)
-            last_time_utc = ticker_data.fast_info.get("last_volume_timestamp")
-            if last_time_utc:
-                quote_time = datetime.datetime.fromtimestamp(last_time_utc, tz=tw_tz).strftime("%Y-%m-%d %H:%M:%S")
+            # 2. 提取最即時的官方撮合時間與價格 (撮合到幾點就顯示幾點，絕不偽造)
+            time_str = info.get('time', '')
+            if time_str:
+                quote_time = datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S")
             else:
-                quote_time = f"{price_date_str} 16:00:00"
-        except Exception:
-            quote_time = f"{price_date_str} 16:00:00"
+                quote_time = now_tw.strftime("%Y-%m-%d %H:%M:%S")
+                
+            # 3. 提取今日即時高、低、現價
+            current_price = realtime_info.get('latest_trade_price')
+            t_h = realtime_info.get('high')
+            t_l = realtime_info.get('low')
+            open_price = realtime_info.get('open')
+            
+            # 安全防禦：如果開盤前或剛開盤數據不齊，從其他欄位遞補
+            if current_price is None or current_price == '-': current_price = open_price
+            if t_h is None or t_h == '-': t_h = current_price
+            if t_l is None or t_l == '-': t_l = current_price
+            
+            current_price = float(current_price)
+            t_h = float(t_h)
+            t_l = float(t_l)
+            
+            # 4. 指數歷史數據獨立抓取 (改用 yfinance 專門針對指數的歷史區間，不跟個股混用)
+            df_index_hist = yf.download(target, period="1mo", progress=False)
+            if isinstance(df_index_hist.columns, pd.MultiIndex):
+                df_index_hist.columns = df_index_hist.columns.get_level_values(0)
+                
+            # 排除今天尚未定案的歷史 K 棒
+            import numpy as np
+            if df_index_hist.index[-1].strftime("%Y-%m-%d") == now_tw.strftime("%Y-%m-%d"):
+                df_index_hist = df_index_hist.iloc[:-1]
+                
+            p_day = df_index_hist.iloc[-1]
+            yesterday_close = float(p_day["Close"])
+            p_h = float(p_day["High"])
+            p_l = float(p_day["Low"])
+            
+            display_name = "上市加權指數" if target == "^TWII" else "櫃買指數"
+            display_name = f"{target} {display_name}"
+            
+        except Exception as e:
+            print(f"指數計算發生異常: {e}")
+            return None
 
-    # ⚡ 漲跌點數與百分比計算
+    # ⚡⚡⚡ 【第二部分：一般個股/美股獨立撰寫邏輯】 ⚡⚡⚡
+    else:
+        ticker_id = f"{target}.TW" if is_tw_stock else target
+        try:
+            df_daily = yf.download(ticker_id, period="1mo", progress=False)
+            if is_tw_stock and df_daily.empty:
+                ticker_id = f"{target}.TWO"
+                df_daily = yf.download(ticker_id, period="1mo", progress=False)
+        except Exception:
+            return None
+
+        if df_daily.empty or len(df_daily) < 3:
+            return None
+
+        if isinstance(df_daily.columns, pd.MultiIndex):
+            df_daily.columns = df_daily.columns.get_level_values(0)
+
+        # 換日防禦
+        import numpy as np
+        if pd.isna(df_daily.iloc[-1]["Close"]) or df_daily.iloc[-1]["Volume"] == 0 or np.isnan(df_daily.iloc[-1]["Close"]):
+            df_daily = df_daily.iloc[:-1]
+
+        if is_tw_stock:
+            # 台灣個股改用 twstock 抓最精準的撮合時間與價格
+            try:
+                rt_id = f"otc_{target}.tw" if ticker_id.endswith(".TWO") else f"tse_{target}.tw"
+                rt_data = twstock.realtime.get(rt_id)
+                if rt_data and rt_data.get('success'):
+                    realtime_info = rt_data['realtime']
+                    current_price = realtime_info.get('latest_trade_price')
+                    if current_price is None or current_price == '-':
+                        current_price = df_daily.iloc[-1]["Close"]
+                    current_price = float(current_price)
+                    
+                    time_str = rt_data['info'].get('time', '')
+                    quote_time = datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S") if time_str else f"{df_daily.index[-1].strftime('%Y-%m-%d')} 13:30:00"
+                else:
+                    raise Exception()
+            except Exception:
+                current_price = float(df_daily.iloc[-1]["Close"])
+                quote_time = f"{df_daily.index[-1].strftime('%Y-%m-%d')} 13:30:00"
+                
+            yesterday_close = float(df_daily.iloc[-2]["Close"])
+            t_day = df_daily.iloc[-1]
+            p_day = df_daily.iloc[-2]
+            t_h, t_l = float(t_day["High"]), float(t_day["Low"])
+            p_h, p_l = float(p_day["High"]), float(p_day["Low"])
+        else:
+            # 美股處理邏輯
+            t_day = df_daily.iloc[-1]
+            p_day = df_daily.iloc[-2]
+            current_price = float(t_day["Close"])
+            yesterday_close = float(p_day["Close"])
+            t_h, t_l = float(t_day["High"]), float(t_day["Low"])
+            p_h, p_l = float(p_day["High"]), float(p_day["Low"])
+            quote_time = df_daily.index[-1].strftime("%Y-%m-%d 16:00:00")
+
+        # 獲取個股中文名稱
+        stock_name = ""
+        if is_tw_stock:
+            try:
+                tw_info = twstock.codes.get(target)
+                if tw_info: stock_name = tw_info.name
+            except Exception: pass
+        if not stock_name:
+            try:
+                stock_name = yf.Ticker(ticker_id).info.get("shortName", target)
+            except Exception: stock_name = target
+            
+        display_name = f"{target} {stock_name}"
+
+    # ⚡⚡⚡ 【第三部分：統一核心數學計算與周月線】 ⚡⚡⚡
+    # 漲跌計算
     change_points = current_price - yesterday_close
     change_percent = (change_points / yesterday_close) * 100
     
@@ -144,10 +170,7 @@ def calculate_stock_prices(stock_id):
     else:
         change_str = f"─ 0.00 (0.00%)"
 
-    # 🔍 關鍵價公式計算 (歷史日K為基底)
-    t_h, t_l = float(t_day["High"]), float(t_day["Low"])
-    p_h, p_l = float(p_day["High"]), float(p_day["Low"])
-
+    # 關鍵價公式
     t_res = t_h + (t_h - t_l) * 0.382
     t_key = (t_h + t_l) / 2
     t_sup = t_l - (t_h - t_l) * 0.382
@@ -156,34 +179,13 @@ def calculate_stock_prices(stock_id):
     p_key = (p_h + p_l) / 2
     p_sup = p_l - (p_h - p_l) * 0.382
 
-    df_weekly = df_daily.resample("W-FRI").agg({"High": "max", "Low": "min"})
+    # 周月線依然由穩定的歷史日K庫計算
+    hist_df = df_index_hist if is_tw_index else df_daily
+    df_weekly = hist_df.resample("W-FRI").agg({"High": "max", "Low": "min"})
     w_key = float((df_weekly.iloc[-1]["High"] + df_weekly.iloc[-1]["Low"]) / 2)
 
-    df_monthly = df_daily.resample("ME").agg({"High": "max", "Low": "min"})
+    df_monthly = hist_df.resample("ME").agg({"High": "max", "Low": "min"})
     m_key = float((df_monthly.iloc[-1]["High"] + df_monthly.iloc[-1]["Low"]) / 2)
-
-    # 獲取官方中文名稱
-    stock_name = ""
-    if is_tw_stock:
-        try:
-            tw_info = twstock.codes.get(stock_id)
-            if tw_info:
-                stock_name = tw_info.name
-        except Exception:
-            pass
-    elif ticker_id.startswith("^TWII"):
-        stock_name = "上市加權指數"
-    elif ticker_id.startswith("^TWOII"):
-        stock_name = "櫃買指數"
-
-    if not stock_name:
-        try:
-            ticker_obj = yf.Ticker(ticker_id)
-            stock_name = ticker_obj.info.get("shortName", stock_id)
-        except Exception:
-            stock_name = stock_id
-
-    display_name = f"{stock_id.upper()} {stock_name}"
 
     return {
         "ticker_id": display_name,
@@ -261,12 +263,12 @@ def process_and_reply_line(reply_token, user_text):
             f"{p['current']:.2f} {p['change_str']}\n"
             f"{p['quote_time']}\n"
             f"━━━━━━━━━━━━━\n"
-            f"今日關鍵價\n"
+            f"【今日關鍵價】\n"
             f"空方防守價：{p['t_res']:.2f}\n"
             f"關鍵價：{p['t_key']:.2f}\n"
             f"多方防守價：{p['t_sup']:.2f}\n"
             f"━━━━━━━━━━━━━\n"
-            f"前日關鍵價\n"
+            f"【前日關鍵價】\n"
             f"空方防守價：{p['p_res']:.2f}\n"
             f"關鍵價：{p['p_key']:.2f}\n"
             f"多方防守價：{p['p_sup']:.2f}\n"

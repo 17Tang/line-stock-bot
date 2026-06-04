@@ -26,25 +26,21 @@ def calculate_stock_prices(stock_id):
     tw_tz = pytz.timezone("Asia/Taipei")
     now_tw = datetime.datetime.now(tw_tz)
     
-    # ⚡ 核心修復：在最源頭直接將輸入字串轉為去空白大寫，確保分流判斷萬無一失
     target = stock_id.upper().strip()
     is_tw_index = target in ["^TWII", "^TWOII"]
     is_tw_stock = len(target) >= 4 and target.isdigit()
 
     print(f"\n================ [ 測試日誌啟動 ] ================")
-    print(f"原始輸入: {stock_id} -> 處理後目標: {target}")
-    print(f"大盤指數判定: {is_tw_index} | 台灣個股判定: {is_tw_stock}")
+    print(f"處理後目標: {target} | 指數判定: {is_tw_index} | 個股判定: {is_tw_stock}")
 
     # ⚡⚡⚡ 【第一部分：大盤指數獨立撰寫邏輯】 ⚡⚡⚡
     if is_tw_index:
         print(f"進入【大盤指數】獨立計算通道...")
         try:
-            # 優先嘗試向 yfinance 下載歷史日K (指數專用)
             df_index_hist = yf.download(target, period="1mo", progress=False)
             if isinstance(df_index_hist.columns, pd.MultiIndex):
                 df_index_hist.columns = df_index_hist.columns.get_level_values(0)
                 
-            # 換日防禦：如果最後一根歷史K是今天，代表是舊的未清算空棒，予以剔除
             if not df_index_hist.empty and df_index_hist.index[-1].strftime("%Y-%m-%d") == now_tw.strftime("%Y-%m-%d"):
                 df_index_hist = df_index_hist.iloc[:-1]
                 
@@ -53,11 +49,9 @@ def calculate_stock_prices(stock_id):
             p_h = float(p_day["High"])
             p_l = float(p_day["Low"])
             
-            # 嘗試抓取官方即時數據
             rt_id = "tse_^TWII" if target == "^TWII" else "otc_^TWOII"
             rt_data = twstock.realtime.get(rt_id)
             
-            # ⚡ 盤前防禦：如果開盤前 twstock 拒絕回傳，自動採用備用日K數據
             if rt_data and rt_data.get('success'):
                 print(f"twstock 指數即時數據獲取成功！")
                 info = rt_data['info']
@@ -80,7 +74,7 @@ def calculate_stock_prices(stock_id):
                 t_h = float(t_h)
                 t_l = float(t_l)
             else:
-                print(f"⚠️ twstock 盤前或超時拒絕，自動啟動大盤日K緩衝備用機制...")
+                print(f"⚠️ twstock 盤前或超時，自動啟動大盤日K備用機制...")
                 current_price = yesterday_close
                 t_h = float(df_index_hist.iloc[-1]["High"])
                 t_l = float(df_index_hist.iloc[-1]["Low"])
@@ -90,7 +84,7 @@ def calculate_stock_prices(stock_id):
             display_name = f"{target} {display_name}"
             
         except Exception as e:
-            print(f"❌ 指數核心通道崩潰: {e}")
+            print(f"❌ 指數核心通道錯誤: {e}")
             return None
 
     # ⚡⚡⚡ 【第二部分：一般個股/美股獨立撰寫邏輯】 ⚡⚡⚡
@@ -107,7 +101,7 @@ def calculate_stock_prices(stock_id):
             return None
 
         if df_daily.empty or len(df_daily) < 3:
-            print(f"❌ 找不到該標的的日K線歷史數據！")
+            print(f"❌ 找不到歷史日K數據")
             return None
 
         if isinstance(df_daily.columns, pd.MultiIndex):
@@ -142,7 +136,6 @@ def calculate_stock_prices(stock_id):
             t_h, t_l = float(t_day["High"]), float(t_day["Low"])
             p_h, p_l = float(p_day["High"]), float(p_day["Low"])
         else:
-            # 美股邏輯
             t_day = df_daily.iloc[-1]
             p_day = df_daily.iloc[-2]
             current_price = float(t_day["Close"])
@@ -164,13 +157,8 @@ def calculate_stock_prices(stock_id):
             
         display_name = f"{target} {stock_name}"
 
-    # ⚡⚡⚡ 【第三部分：數據終端列印檢查與核心公式】 ⚡⚡⚡
-    print(f"--- 數據檢查斷點 (Data Print Check) ---")
-    print(f"顯示名稱: {display_name}")
-    print(f"計算現價: {current_price} | 昨收價: {yesterday_close}")
-    print(f"今日高點: {t_h} | 今日低點: {t_l}")
-    print(f"前日高點: {p_h} | 前日低點: {p_l}")
-    print(f"報價時間: {quote_time}")
+    print(f"--- 數據檢查 ---")
+    print(f"名稱: {display_name} | 現價: {current_price} | 時間: {quote_time}")
     print(f"================================================\n")
 
     # 漲跌點數與百分比計算
@@ -184,7 +172,6 @@ def calculate_stock_prices(stock_id):
     else:
         change_str = f"─ 0.00 (0.00%)"
 
-    # 關鍵價公式
     t_res = t_h + (t_h - t_l) * 0.382
     t_key = (t_h + t_l) / 2
     t_sup = t_l - (t_h - t_l) * 0.382
@@ -248,11 +235,11 @@ def verify_signature(body, signature):
     return hmac.compare_digest(expected_signature, signature)
 
 # ==========================================
-# ✉️ LINE 訊息回覆傳送邏輯 (移除多餘標題)
+# ✉️ LINE 訊息回覆傳送邏輯 (完全移除多餘標題)
 # ==========================================
 def process_and_reply_line(reply_token, user_text):
     if user_text == "開始" or user_text.lower() == "hello":
-        send_line_reply(reply_token, "歡迎使用關鍵價看盤助手！\n\n💡 請在股號前加一個『#』即可查詢。\n👉 例如輸入：#2330 或 #^TWII")
+        send_line_reply(reply_token, "歡迎使用關鍵價看盤助手！\n\n請在股號前加一個『#』即可查詢。\n例如輸入：#2330 或 #^TWII")
         return
 
     if not user_text.startswith("#"):
@@ -268,7 +255,7 @@ def process_and_reply_line(reply_token, user_text):
             send_line_reply(reply_token, f"❌ 找不到股票代號 '{stock_id}' 的資料。")
             return
 
-        # ⚡ 遵照吩咐：完全拿掉 【標的】：、 【現價】：、 【時間】： 這三個中文字標題
+        # ⚡ 移除 【標的】：、 【現價】：、 【時間】：，呈現最純粹極簡格式
         report_text = (
             f"{p['ticker_id']}\n"
             f"{p['current']:.2f} {p['change_str']}\n"
@@ -294,8 +281,9 @@ def process_and_reply_line(reply_token, user_text):
 
 def send_line_reply(reply_token, text):
     url = "https://api.line.me/v2/bot/message/reply"
+    # ⚡ 終極修正：將 Content-Type 修正回標準的 "application/json"，解封啞巴狀態！
     headers = {
-        "Content-Type": "https://api.line.me/v2/bot/message/reply",
+        "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_ACCESS_TOKEN}"
     }
     payload = {

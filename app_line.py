@@ -12,6 +12,7 @@ import pandas as pd
 import yfinance as yf
 import twstock
 import requests
+import numpy as np
 
 # ==========================================
 # ⚙️ 核心設定區
@@ -19,19 +20,19 @@ import requests
 LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 
-# ⚡ 防封鎖偽裝：避免 Yahoo API 拒絕連線
+# 防封鎖偽裝
 yf_session = requests.Session()
 yf_session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 })
 
 # ==========================================
-# 📊 數據下載與關鍵價計算 (與 Streamlit 完全一致版)
+# 📊 數據下載與關鍵價計算
 # ==========================================
 def calculate_stock_prices(stock_id):
     days_back = 365
     today = datetime.date.today()
-    # ⚡ 完美對齊 Streamlit：結束日期設為明天，確保抓到最新日 K
+    # 確保抓到最新日K
     end_date = today + datetime.timedelta(days=1)
     start_date = today - datetime.timedelta(days=days_back)
     
@@ -46,7 +47,6 @@ def calculate_stock_prices(stock_id):
     else:
         yf_id = clean_target
 
-    # 1. 統一使用 yfinance 下載日 K
     try:
         df_daily = yf.download(yf_id, start=start_date, end=end_date, progress=False, session=yf_session)
         if is_tw_stock and df_daily.empty:
@@ -61,12 +61,11 @@ def calculate_stock_prices(stock_id):
     if isinstance(df_daily.columns, pd.MultiIndex):
         df_daily.columns = df_daily.columns.get_level_values(0)
 
-    # 換日空值防禦 (確保拿到有效的 K 棒)
-    import numpy as np
-    if pd.isna(df_daily.iloc[-1]["Close"]) or df_daily.iloc[-1]["Volume"] == 0 or np.isnan(df_daily.iloc[-1]["Close"]):
+    # ⚡ 致命 Bug 修正：絕對不可檢查 Volume == 0，只檢查 Close 是否為 NaN
+    if pd.isna(df_daily.iloc[-1]["Close"]) or np.isnan(float(df_daily.iloc[-1]["Close"])):
         df_daily = df_daily.iloc[:-1]
 
-    # ⚡ 2. 數據提取 (完全對齊 Streamlit 邏輯)
+    # 提取數據 (完全對齊 Streamlit)
     t_day = df_daily.iloc[-1]
     p_day = df_daily.iloc[-2]
     
@@ -75,11 +74,9 @@ def calculate_stock_prices(stock_id):
 
     current_price = t_c
     yesterday_close = p_c
-    
-    # 時間不再硬擠分秒，直接顯示乾淨的 K 棒日期
     quote_time = df_daily.index[-1].strftime("%Y-%m-%d")
 
-    # 3. 漲跌點數與百分比計算
+    # 漲跌計算
     change_points = current_price - yesterday_close
     change_percent = (change_points / yesterday_close) * 100
     
@@ -90,7 +87,7 @@ def calculate_stock_prices(stock_id):
     else:
         change_str = f"─ 0.00 (0.00%)"
 
-    # 4. 關鍵價核心公式
+    # 關鍵價公式
     t_res = t_h + (t_h - t_l) * 0.382
     t_key = (t_h + t_l) / 2
     t_sup = t_l - (t_h - t_l) * 0.382
@@ -106,7 +103,7 @@ def calculate_stock_prices(stock_id):
     df_monthly = df_daily.resample("ME").agg({"High": "max", "Low": "min"}).dropna()
     m_key = float((df_monthly.iloc[-1]["High"] + df_monthly.iloc[-1]["Low"]) / 2)
 
-    # 5. 名稱轉換
+    # 名稱轉換
     stock_name = ""
     if is_tw_index:
         stock_name = "上市加權指數" if clean_target == "TWII" else "櫃買指數"
@@ -193,7 +190,6 @@ def process_and_reply_line(reply_token, user_text):
             send_line_reply(reply_token, f"❌ 找不到 '{stock_id}' 的資料，或伺服器目前遭限流，請稍後再試。")
             return
 
-        # ⚡ 純淨無標題格式，時間僅顯示日期
         report_text = (
             f"{p['ticker_id']}\n"
             f"{p['current']:.2f} {p['change_str']}\n"

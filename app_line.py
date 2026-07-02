@@ -178,7 +178,7 @@ def verify_signature(body, signature):
     return hmac.compare_digest(expected_signature, signature)
 
 # ==========================================
-# ✉️ LINE 訊息回覆傳送邏輯 (新增即時多空狀態判斷)
+# ✉️ LINE 訊息回覆傳送邏輯 (修正為昨日關鍵價比對)
 # ==========================================
 def process_and_reply_line(reply_token, user_text):
     if user_text == "開始" or user_text.lower() == "hello":
@@ -198,21 +198,20 @@ def process_and_reply_line(reply_token, user_text):
             send_line_reply(reply_token, f"❌ 找不到 '{stock_id}' 的資料，或伺服器目前遭限流，請稍後再試。")
             return
 
-        # ⚡ 核心改動：加入多空狀態診斷邏輯
         current = p['current']
         
-        # 1. 判斷今日防守價突破/跌破
-        if current > p['t_res']:
-            status_today = "📈 現價已【漲過】今日空方防守"
-        elif current < p['t_sup']:
-            status_today = "📉 現價已【跌破】今日多方防守"
+        # ⚡ 核心修改：依昨日關鍵價進行多空階層判斷
+        if current < p['p_sup']:
+            status_yesterday = "🚨 極度空頭"
+        elif current < p['p_key']:
+            status_yesterday = "🟡 未達關鍵價"
+        elif current <= p['p_res']:
+            status_yesterday = "🔵 未達空方防守價"
         else:
-            status_today = "⚖️ 現價在今日多空防守區間內"
+            status_yesterday = "🔥 強勢多頭"
 
-        # 2. 判斷是否大於周關鍵價
+        # 判斷是否大於周、月關鍵價
         status_week = "🟢 站上周關鍵價" if current >= p['w_key'] else "🔴 低於周關鍵價"
-        
-        # 3. 判斷是否大於月關鍵價
         status_month = "🟢 站上月關鍵價" if current >= p['m_key'] else "🔴 低於月關鍵價"
 
         report_text = (
@@ -221,7 +220,7 @@ def process_and_reply_line(reply_token, user_text):
             f"{p['quote_time']}\n"
             f"━━━━━━━━━━━━━\n"
             f"【即時多空狀態】\n"
-            f"{status_today}\n"
+            f"昨日階層定位：{status_yesterday}\n"
             f"{status_week}\n"
             f"{status_month}\n"
             f"━━━━━━━━━━━━━\n"

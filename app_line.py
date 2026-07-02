@@ -27,7 +27,69 @@ yf_session.headers.update({
 })
 
 # ==========================================
-# 📊 數據下載與關鍵價計算 (全資產完美相容版)
+# 🇹🇼 方案 B：台灣官方 API 歷史資料抓取器
+# ==========================================
+def get_taiwan_official_index(is_tpex=False):
+    """
+    直接從台灣證交所/櫃買中心抓取歷史大盤 JSON 資料。
+    抓取近三個月的資料，確保月線與周線計算有充足基期。
+    """
+    today = datetime.date.today()
+    first_day_this_month = today.replace(day=1)
+    last_month_end = first_day_this_month - datetime.timedelta(days=1)
+    first_day_last_month = last_month_end.replace(day=1)
+    two_months_ago_end = first_day_last_month - datetime.timedelta(days=1)
+    first_day_two_months_ago = two_months_ago_end.replace(day=1)
+
+    dates_to_fetch = [first_day_two_months_ago, first_day_last_month, first_day_this_month]
+    df_list = []
+
+    for d in dates_to_fetch:
+        try:
+            if not is_tpex:
+                # 證交所 (上市加權指數 TWII)
+                date_str = d.strftime("%Y%m%d")
+                url = f"https://www.twse.com.tw/indicesReport/MI_5MINS_HIST?response=json&date={date_str}"
+                res = requests.get(url, headers=yf_session.headers, timeout=5).json()
+                if res.get("stat") == "OK":
+                    for row in res["data"]:
+                        dp = row[0].split('/')
+                        dt = pd.to_datetime(f"{int(dp[0])+1911}-{dp[1]}-{dp[2]}")
+                        df_list.append({
+                            "Date": dt,
+                            "High": float(row[2].replace(',', '').strip()),
+                            "Low": float(row[3].replace(',', '').strip()),
+                            "Close": float(row[4].replace(',', '').strip())
+                        })
+            else:
+                # 櫃買中心 (櫃買指數 TWOII)
+                roc_ym = f"{d.year - 1911}/{d.strftime('%m')}"
+                url = f"https://www.tpex.org.tw/web/stock/aftertrading/index_historical/histo_result.php?l=zh-tw&d={roc_ym}"
+                res = requests.get(url, headers=yf_session.headers, timeout=5).json()
+                if "aaData" in res:
+                    for row in res["aaData"]:
+                        dp = row[0].split('/')
+                        dt = pd.to_datetime(f"{int(dp[0])+1911}-{dp[1]}-{dp[2]}")
+                        df_list.append({
+                            "Date": dt,
+                            "High": float(row[2].replace(',', '').strip()),
+                            "Low": float(row[3].replace(',', '').strip()),
+                            "Close": float(row[4].replace(',', '').strip())
+                        })
+        except Exception as e:
+            print(f"台灣官方 API 獲取失敗 ({d}): {e}")
+
+    if df_list:
+        df = pd.DataFrame(df_list)
+        df.set_index("Date", inplace=True)
+        # 去除重複並確保按日期遞增排序
+        df = df[~df.index.duplicated(keep='last')]
+        df.sort_index(inplace=True)
+        return df
+    return pd.DataFrame()
+
+# ==========================================
+# 📊 數據下載與關鍵價計算 (官方API + yfinance完美相容版)
 # ==========================================
 def calculate_stock_prices(stock_id):
     days_back = 365
@@ -35,41 +97,59 @@ def calculate_stock_prices(stock_id):
     end_date = today + datetime.timedelta(days=1)
     start_date = today - datetime.timedelta(days=days_back)
     
-    # ⚡ 核心修復：轉大寫去空白，但不亂動 ^ 符號
     target = stock_id.upper().strip()
+    is_tpex = False
     
-    # 精準分流判定：只針對台股大盤做特殊相容，其餘美股指數(如 ^SOX)原樣保留
     if target in ["TWII", "^TWII"]:
         yf_id = "^TWII"
         is_tw_index = True
         is_tw_stock = False
+        is_tpex = False
     elif target in ["TWOII", "^TWOII"]:
         yf_id = "^TWOII"
         is_tw_index = True
         is_tw_stock = False
+        is_tpex = True
     else:
         is_tw_index = False
-        # 判定是否為純數字台股
         is_tw_stock = target.replace(".", "").isdigit() and len(target) >= 4
         yf_id = f"{target}.TW" if is_tw_stock else target
 
     print(f"--- 查詢代號確認: {yf_id} ---")
 
-    try:
-        df_daily = yf.download(yf_id, start=start_date, end=end_date, progress=False, session=yf_session)
-        if is_tw_stock and df_daily.empty:
-            yf_id = f"{target}.TWO"
-            df_daily = yf.download(yf_id, start=start_date, end=end_date, progress=False, session=yf_session)
-    except Exception:
-        return None
+    df_daily = pd.DataFrame()
+
+    # 🚀 路線一：大盤指數直連台灣官方伺服器
+    if is_tw_index:
+        print("🟢 啟用方案 B：使用台灣官方 API 獲取大盤資料...")
+        df_daily = get_taiwan_official_index(is_tpex)
+        if df_daily.empty:
+            print("⚠️ 官方 API 暫無回應，退回備用 Yahoo Finance 歷史資料")
+
+    # 🚀 路線二：個股或官方 API 失敗時，走 yfinance (.history 穩定版)
+    if not is_tw_index or df_daily.empty:
+        try:
+            ticker_obj = yf.Ticker(yf_id, session=yf_session)
+            df_daily = ticker_obj.history(start=start_date, end=end_date, interval="1d")
+            
+            # 台股上市找不到，自動轉上櫃
+            if is_tw_stock and df_daily.empty:
+                yf_id = f"{target}.TWO"
+                ticker_obj = yf.Ticker(yf_id, session=yf_session)
+                df_daily = ticker_obj.history(start=start_date, end=end_date, interval="1d")
+                
+            if isinstance(df_daily.columns, pd.MultiIndex):
+                df_daily.columns = df_daily.columns.get_level_values(0)
+            
+            # 確保欄位字首大寫，與後續邏輯吻合
+            df_daily.rename(columns=lambda x: x.capitalize(), inplace=True)
+        except Exception:
+            return None
 
     if df_daily.empty or len(df_daily) < 2:
         return None
 
-    if isinstance(df_daily.columns, pd.MultiIndex):
-        df_daily.columns = df_daily.columns.get_level_values(0)
-
-    # 僅檢查 NaN 空棒，不檢查 Volume
+    # 僅檢查 NaN 空棒
     if pd.isna(df_daily.iloc[-1]["Close"]) or np.isnan(float(df_daily.iloc[-1]["Close"])):
         df_daily = df_daily.iloc[:-1]
 
@@ -103,7 +183,7 @@ def calculate_stock_prices(stock_id):
     p_key = (p_h + p_l) / 2
     p_sup = p_l - (p_h - p_l) * 0.382
 
-    # 周月線計算
+    # 周月線計算 (相容官方資料與 Yahoo 資料)
     df_weekly = df_daily.resample("W-FRI").agg({"High": "max", "Low": "min"}).dropna()
     w_key = float((df_weekly.iloc[-1]["High"] + df_weekly.iloc[-1]["Low"]) / 2)
 
@@ -112,9 +192,9 @@ def calculate_stock_prices(stock_id):
 
     # 名稱轉換
     stock_name = ""
-    if yf_id == "^TWII":
+    if is_tw_index and not is_tpex:
         stock_name = "上市加權指數"
-    elif yf_id == "^TWOII":
+    elif is_tw_index and is_tpex:
         stock_name = "櫃買指數"
     elif is_tw_stock:
         try:
@@ -178,7 +258,7 @@ def verify_signature(body, signature):
     return hmac.compare_digest(expected_signature, signature)
 
 # ==========================================
-# ✉️ LINE 訊息回覆傳送邏輯 (修正為昨日關鍵價比對)
+# ✉️ LINE 訊息回覆傳送邏輯 (昨日關鍵價比對版本)
 # ==========================================
 def process_and_reply_line(reply_token, user_text):
     if user_text == "開始" or user_text.lower() == "hello":
@@ -200,15 +280,15 @@ def process_and_reply_line(reply_token, user_text):
 
         current = p['current']
         
-        # ⚡ 核心修改：依昨日關鍵價進行多空階層判斷
+        # 依昨日關鍵價進行多空階層判斷
         if current < p['p_sup']:
-            status_yesterday = "🚨跌破多防價 極度空頭"
+            status_yesterday = "🚨 跌破多防價 極度空頭"
         elif current < p['p_key']:
-            status_yesterday = "🟡小於關鍵價"
+            status_yesterday = "🟡 小於AC 未破多防"
         elif current <= p['p_res']:
-            status_yesterday = "🔵大於關鍵價"
+            status_yesterday = "🔵 大於AC 未達空防"
         else:
-            status_yesterday = "🔥漲過空防 強勢多頭"
+            status_yesterday = "🔥 漲破空防 強勢多頭"
 
         # 判斷是否大於周、月關鍵價
         status_week = "🟢 站上周關鍵價" if current >= p['w_key'] else "🔴 低於周關鍵價"

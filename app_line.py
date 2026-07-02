@@ -202,13 +202,13 @@ def process_and_reply_line(reply_token, user_text):
         
         # ⚡ 核心修改：依昨日關鍵價進行多空階層判斷
         if current < p['p_sup']:
-            status_yesterday = "🚨 極度空頭"
+            status_yesterday = "🚨跌破多防價 極度空頭"
         elif current < p['p_key']:
-            status_yesterday = "🟡 未達關鍵價"
+            status_yesterday = "🟡小於關鍵價"
         elif current <= p['p_res']:
-            status_yesterday = "🔵 未達空方防守價"
+            status_yesterday = "🔵大於關鍵價"
         else:
-            status_yesterday = "🔥 強勢多頭"
+            status_yesterday = "🔥漲過空防 強勢多頭"
 
         # 判斷是否大於周、月關鍵價
         status_week = "🟢 站上周關鍵價" if current >= p['w_key'] else "🔴 低於周關鍵價"
@@ -220,7 +220,7 @@ def process_and_reply_line(reply_token, user_text):
             f"{p['quote_time']}\n"
             f"━━━━━━━━━━━━━\n"
             f"【即時多空狀態】\n"
-            f"昨日階層定位：{status_yesterday}\n"
+            f"{status_yesterday}\n"
             f"{status_week}\n"
             f"{status_month}\n"
             f"━━━━━━━━━━━━━\n"

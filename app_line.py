@@ -178,7 +178,7 @@ def verify_signature(body, signature):
     return hmac.compare_digest(expected_signature, signature)
 
 # ==========================================
-# ✉️ LINE 訊息回覆傳送邏輯 (維持極簡無標題)
+# ✉️ LINE 訊息回覆傳送邏輯 (新增即時多空狀態判斷)
 # ==========================================
 def process_and_reply_line(reply_token, user_text):
     if user_text == "開始" or user_text.lower() == "hello":
@@ -198,10 +198,32 @@ def process_and_reply_line(reply_token, user_text):
             send_line_reply(reply_token, f"❌ 找不到 '{stock_id}' 的資料，或伺服器目前遭限流，請稍後再試。")
             return
 
+        # ⚡ 核心改動：加入多空狀態診斷邏輯
+        current = p['current']
+        
+        # 1. 判斷今日防守價突破/跌破
+        if current > p['t_res']:
+            status_today = "📈 現價已【漲過】今日空方防守"
+        elif current < p['t_sup']:
+            status_today = "📉 現價已【跌破】今日多方防守"
+        else:
+            status_today = "⚖️ 現價在今日多空防守區間內"
+
+        # 2. 判斷是否大於周關鍵價
+        status_week = "🟢 站上周關鍵價" if current >= p['w_key'] else "🔴 低於周關鍵價"
+        
+        # 3. 判斷是否大於月關鍵價
+        status_month = "🟢 站上月關鍵價" if current >= p['m_key'] else "🔴 低於月關鍵價"
+
         report_text = (
             f"{p['ticker_id']}\n"
             f"{p['current']:.2f} {p['change_str']}\n"
             f"{p['quote_time']}\n"
+            f"━━━━━━━━━━━━━\n"
+            f"【即時多空狀態】\n"
+            f"{status_today}\n"
+            f"{status_week}\n"
+            f"{status_month}\n"
             f"━━━━━━━━━━━━━\n"
             f"【今日關鍵價】\n"
             f"空方防守價：{p['t_res']:.2f}\n"

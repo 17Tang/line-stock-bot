@@ -247,8 +247,8 @@ def process_and_reply_line(reply_token, user_text):
             status_yesterday = "🔥 漲過空防價 強勢多頭"
 
         # 判斷是否大於周、月關鍵價
-        status_week = "🔴 低於周關鍵價" if current < p['w_key'] else "🟢 站上周關鍵價"
-        status_month = "🔴 低於月關鍵價" if current < p['m_key'] else "🟢 站上月關鍵價"
+        status_week = "🟢 低於周關鍵價" if current < p['w_key'] else "🔴 站上周關鍵價"
+        status_month = "🟢 低於月關鍵價" if current < p['m_key'] else "🔴 站上月關鍵價"
 
         report_text = (
             f"{p['ticker_id']}\n"

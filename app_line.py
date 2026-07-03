@@ -9,7 +9,6 @@ import os
 import threading
 import httpx
 import pandas as pd
-import yfinance as yf
 import twstock
 import requests
 import numpy as np
@@ -20,159 +19,162 @@ import numpy as np
 LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 
-# 🔥 100% 恢復原本最強的防封鎖偽裝 Session，解鎖個股查詢
-yf_session = requests.Session()
-yf_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-})
-
 # ==========================================
-# 📊 數據下載與關鍵價計算 (初心回歸 + 輕量即時補丁版)
+# 📊 數據下載與關鍵價計算 (FinMind 終極穩定版)
 # ==========================================
 def calculate_stock_prices(stock_id):
-    days_back = 365
-    today = datetime.date.today()
-    end_date = today + datetime.timedelta(days=1)
-    start_date = today - datetime.timedelta(days=days_back)
-    
-    target = stock_id.upper().strip()
-    
-    # 精準判定資產類型與官方 MiS 對應代號
-    if target in ["TWII", "^TWII"]:
-        yf_id = "^TWII"
-        is_index = True
-        is_tw_stock = False
-        mis_ch = "tse_t00.tw"
-    elif target in ["TWOII", "^TWOII"]:
-        yf_id = "^TWOII"
-        is_index = True
-        is_tw_stock = False
-        mis_ch = "otc_o00.tw"
-    else:
-        is_index = False
-        is_tw_stock = target.replace(".", "").isdigit() and len(target) >= 4
-        yf_id = f"{target}.TW" if is_tw_stock else target
-        mis_ch = f"tse_{target}.tw"
-
-    print(f"--- 查詢代號確認: {yf_id} ---")
-
-    # 🚀 步驟一：用原本最穩定的 yf.download 下載歷史基礎
     try:
-        df_daily = yf.download(yf_id, start=start_date, end=end_date, progress=False, session=yf_session)
-        if is_tw_stock and df_daily.empty:
-            yf_id = f"{target}.TWO"
-            df_daily = yf.download(yf_id, start=start_date, end=end_date, progress=False, session=yf_session)
-            mis_ch = f"otc_{target}.tw"
-    except Exception as e:
-        print(f"Yahoo 歷史下載失敗: {e}")
-        return None
-
-    if df_daily.empty or len(df_daily) < 2:
-        return None
-
-    if isinstance(df_daily.columns, pd.MultiIndex):
-        df_daily.columns = df_daily.columns.get_level_values(0)
-
-    # 🚀 步驟二：解決 Yahoo 大盤卡死凍結地雷 (若歷史最新日期落後今天，用官方 MiS 即時補齊)
-    try:
-        latest_date = df_daily.index[-1].date()
-        if latest_date < today and (is_index or is_tw_stock):
-            print(f"⚠️ 偵測到 Yahoo 日期延遲 ({latest_date})，強行調用台灣官方 MiS 補丁...")
-            url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={mis_ch}"
-            res = requests.get(url, headers=yf_session.headers, timeout=5).json()
-            
-            if "msgArray" in res and len(res["msgArray"]) > 0:
-                info = res["msgArray"][0]
-                price_str = info.get("z") or info.get("v") or info.get("o")
-                
-                if price_str and price_str != "-":
-                    live_dt = pd.to_datetime(info["d"])
-                    live_high = float(info["h"].replace(',', ''))
-                    live_low = float(info["l"].replace(',', ''))
-                    live_close = float(price_str.replace(',', ''))
-                    
-                    # 強行寫入今日最新 K 線
-                    df_daily.loc[live_dt, "High"] = live_high
-                    df_daily.loc[live_dt, "Low"] = live_low
-                    df_daily.loc[live_dt, "Close"] = live_close
-                    
-                    # 清除重複並重新排序
-                    df_daily = df_daily[~df_daily.index.duplicated(keep='last')]
-                    df_daily.sort_index(inplace=True)
-                    print(f"🟢 成功補齊今日 ({info['d']}) 官方即時數據！")
-    except Exception as e:
-        print(f"⚠️ 嘗試即時補丁無回應 (無礙後續計算): {e}")
-
-    # 僅檢查 NaN 空棒
-    if pd.isna(df_daily.iloc[-1]["Close"]) or np.isnan(float(df_daily.iloc[-1]["Close"])):
-        df_daily = df_daily.iloc[:-1]
-
-    t_day = df_daily.iloc[-1]
-    p_day = df_daily.iloc[-2]
-    
-    t_h, t_l, t_c = float(t_day["High"]), float(t_day["Low"]), float(t_day["Close"])
-    p_h, p_l, p_c = float(p_day["High"]), float(p_day["Low"]), float(p_day["Close"])
-
-    current_price = t_c
-    yesterday_close = p_c
-    quote_time = df_daily.index[-1].strftime("%Y-%m-%d")
-
-    # 漲跌計算
-    change_points = current_price - yesterday_close
-    change_percent = (change_points / yesterday_close) * 100
-    
-    if change_points > 0:
-        change_str = f"▲ {change_points:.2f} (+{change_percent:.2f}%)"
-    elif change_points < 0:
-        change_str = f"▼ {abs(change_points):.2f} (-{abs(change_percent):.2f}%)"
-    else:
-        change_str = f"─ 0.00 (0.00%)"
-
-    # 關鍵價公式
-    t_res = t_h + (t_h - t_l) * 0.382
-    t_key = (t_h + t_l) / 2
-    t_sup = t_l - (t_h - t_l) * 0.382
-
-    p_res = p_h + (p_h - p_l) * 0.382
-    p_key = (p_h + p_l) / 2
-    p_sup = p_l - (p_h - p_l) * 0.382
-
-    # 周月線計算
-    df_weekly = df_daily.resample("W-FRI").agg({"High": "max", "Low": "min"}).dropna()
-    w_key = float((df_weekly.iloc[-1]["High"] + df_weekly.iloc[-1]["Low"]) / 2)
-
-    df_monthly = df_daily.resample("ME").agg({"High": "max", "Low": "min"}).dropna()
-    m_key = float((df_monthly.iloc[-1]["High"] + df_monthly.iloc[-1]["Low"]) / 2)
-
-    # 名稱轉換
-    stock_name = ""
-    if yf_id == "^TWII":
-        stock_name = "上市加權指數"
-    elif yf_id == "^TWOII":
-        stock_name = "櫃買指數"
-    elif is_tw_stock:
-        try:
-            tw_info = twstock.codes.get(target)
-            if tw_info: stock_name = tw_info.name
-        except Exception: pass
+        days_back = 365
+        today = datetime.date.today()
+        start_date = today - datetime.timedelta(days=days_back)
         
-    if not stock_name:
+        target = stock_id.upper().strip()
+        
+        # ⚡ 1. 精準對齊 FinMind 的大盤代號與官方 MiS 代號
+        if target in ["TWII", "^TWII", "TAIEX"]:
+            finmind_id = "TAIEX"
+            mis_ch = "tse_t00.tw"
+            display_name = "^TWII 上市加權指數"
+            is_tw_stock = False
+        elif target in ["TWOII", "^TWOII", "TWO"]:
+            finmind_id = "TWO"
+            mis_ch = "otc_o00.tw"
+            display_name = "^TWOII 櫃買指數"
+            is_tw_stock = False
+        else:
+            finmind_id = target
+            is_tw_stock = target.replace(".", "").isdigit() and len(target) >= 4
+            display_name = target
+            mis_ch = f"tse_{target}.tw"  # 預設上市
+
+        # ⚡ 2. 如果是個股，利用 twstock 自動判斷上市/上櫃，精準導航 MiS 即時補丁路徑
+        if is_tw_stock:
+            try:
+                tw_info = twstock.codes.get(target)
+                if tw_info:
+                    display_name = f"{target} {tw_info.name}"
+                    if tw_info.market == "上櫃":
+                        mis_ch = f"otc_{target}.tw"
+                    else:
+                        mis_ch = f"tse_{target}.tw"
+            except Exception:
+                pass
+
+        print(f"--- FinMind 查詢確認: {finmind_id} (MiS補丁通道: {mis_ch}) ---")
+
+        # 🚀 路線一：直連 FinMind 獲取歷史大數據
+        url = "https://api.finmindtrade.com/api/v4/data"
+        params = {
+            "dataset": "TaiwanStockPrice",
+            "data_id": finmind_id,
+            "start_date": start_date.strftime("%Y-%m-%d")
+        }
+        
+        res = requests.get(url, params=params, timeout=10).json()
+        if res.get("msg") != "success" or not res.get("data"):
+            print(f"❌ FinMind 未能取得 {finmind_id} 的歷史資料")
+            return None
+            
+        # 轉換為標準 DataFrame
+        df_raw = pd.DataFrame(res["data"])
+        df_raw['date'] = pd.to_datetime(df_raw['date'])
+        df_raw.set_index('date', inplace=True)
+        
+        # ⚡ 關鍵清洗：將 FinMind 的欄位名 (max, min, close) 對齊原本的運算邏輯 (High, Low, Close)
+        df_daily = pd.DataFrame(index=df_raw.index)
+        df_daily['High'] = df_raw['max'].astype(float)
+        df_daily['Low'] = df_raw['min'].astype(float)
+        df_daily['Close'] = df_raw['close'].astype(float)
+
+        if df_daily.empty or len(df_daily) < 2:
+            return None
+
+        mis_yesterday_close = None
+
+        # 🚀 路線二（盤中即時補丁）：如果 FinMind 最新歷史落後今天，調用官方 MiS 秒速補齊
         try:
-            stock_name = yf.Ticker(yf_id, session=yf_session).info.get("shortName", target)
-        except Exception:
-            stock_name = target
+            latest_date = df_daily.index[-1].date()
+            if latest_date < today:
+                print(f"⚠️ 歷史數據日期 ({latest_date}) 尚未更新，強行載入 MiS 盤中即時補丁...")
+                mis_url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={mis_ch}"
+                mis_res = requests.get(mis_url, timeout=5).json()
+                
+                if "msgArray" in mis_res and len(mis_res["msgArray"]) > 0:
+                    info = mis_res["msgArray"][0]
+                    price_str = info.get("z") or info.get("v") or info.get("o")
+                    
+                    if price_str and price_str != "-":
+                        live_dt = pd.to_datetime(info["d"])
+                        live_high = float(info["h"].replace(',', ''))
+                        live_low = float(info["l"].replace(',', ''))
+                        live_close = float(price_str.replace(',', ''))
+                        
+                        # 從官方擷取昨收參考價，防止斷流日差導致漲跌算錯
+                        if info.get("y") and info["y"] != "-":
+                            mis_yesterday_close = float(info["y"].replace(',', ''))
+                        
+                        # 壓入 DataFrame 尾端
+                        df_daily.loc[live_dt] = [live_high, live_low, live_close]
+                        df_daily = df_daily[~df_daily.index.duplicated(keep='last')]
+                        df_daily.sort_index(inplace=True)
+                        print(f"🟢 成功補齊今日 MiS 即時數據！昨收參考價為: {mis_yesterday_close}")
+        except Exception as e:
+            print(f"⚠️ 嘗試即時補丁無回應 (無礙後續歷史計算): {e}")
 
-    display_name = f"{yf_id} {stock_name}"
+        # 僅檢查 NaN 空棒
+        if pd.isna(df_daily.iloc[-1]["Close"]) or np.isnan(float(df_daily.iloc[-1]["Close"])):
+            df_daily = df_daily.iloc[:-1]
 
-    return {
-        "ticker_id": display_name,
-        "current": current_price,
-        "change_str": change_str,
-        "quote_time": quote_time,
-        "t_res": t_res, "t_key": t_key, "t_sup": t_sup,
-        "p_res": p_res, "p_key": p_key, "p_sup": p_sup,
-        "w_key": w_key, "m_key": m_key
-    }
+        t_day = df_daily.iloc[-1]
+        p_day = df_daily.iloc[-2]
+        
+        t_h, t_l, t_c = float(t_day["High"]), float(t_day["Low"]), float(t_day["Close"])
+        p_h, p_l, p_c = float(p_day["High"]), float(p_day["Low"]), float(p_day["Close"])
+
+        current_price = t_c
+        
+        # 精準漲跌校正
+        yesterday_close = mis_yesterday_close if mis_yesterday_close is not None else p_c
+        quote_time = df_daily.index[-1].strftime("%Y-%m-%d")
+
+        change_points = current_price - yesterday_close
+        change_percent = (change_points / yesterday_close) * 100
+        
+        if change_points > 0:
+            change_str = f"▲ {change_points:.2f} (+{change_percent:.2f}%)"
+        elif change_points < 0:
+            change_str = f"▼ {abs(change_points):.2f} (-{abs(change_percent):.2f}%)"
+        else:
+            change_str = f"─ 0.00 (0.00%)"
+
+        # 原汁原味關鍵價核心公式
+        t_res = t_h + (t_h - t_l) * 0.382
+        t_key = (t_h + t_l) / 2
+        t_sup = t_l - (t_h - t_l) * 0.382
+
+        p_res = p_h + (p_h - p_l) * 0.382
+        p_key = (p_h + p_l) / 2
+        p_sup = p_l - (p_h - p_l) * 0.382
+
+        # 周月線計算
+        df_weekly = df_daily.resample("W-FRI").agg({"High": "max", "Low": "min"}).dropna()
+        w_key = float((df_weekly.iloc[-1]["High"] + df_weekly.iloc[-1]["Low"]) / 2)
+
+        df_monthly = df_daily.resample("ME").agg({"High": "max", "Low": "min"}).dropna()
+        m_key = float((df_monthly.iloc[-1]["High"] + df_monthly.iloc[-1]["Low"]) / 2)
+
+        return {
+            "ticker_id": display_name,
+            "current": current_price,
+            "change_str": change_str,
+            "quote_time": quote_time,
+            "t_res": t_res, "t_key": t_key, "t_sup": t_sup,
+            "p_res": p_res, "p_key": p_key, "p_sup": p_sup,
+            "w_key": w_key, "m_key": m_key
+        }
+    except Exception as e:
+        print(f"核心計算異常: {e}")
+        return None
 
 # ==========================================
 # 🤖 LINE Webhook 伺服器接收端
@@ -234,7 +236,7 @@ def process_and_reply_line(reply_token, user_text):
 
         current = p['current']
         
-        # ⚡ 依昨日關鍵價進行多空階層判斷 (精準文字指定版)
+        # 昨日關鍵價指定多空階層判斷文字
         if current < p['p_sup']:
             status_yesterday = "🚨 跌破多防價 極度空頭"
         elif current < p['p_key']:
